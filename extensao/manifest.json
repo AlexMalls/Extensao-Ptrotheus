@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "Positiva - Automacao Protheus",
+  "version": "5.7.8",
+  "description": "Automação do Protheus por ambiente, com rotinas financeiras e Gravador Geral para mapear fluxos manuais.",
+  "permissions": [
+    "scripting",
+    "tabs",
+    "debugger",
+    "nativeMessaging",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://erp.positiva.com.br/*",
+    "https://erp-corretora.positiva.com.br/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://erp.positiva.com.br/*",
+        "https://erp-corretora.positiva.com.br/*"
+      ],
+      "js": [
+        "diagnostic.js",
+        "automation.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Positiva - Automacao Protheus",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  }
+}

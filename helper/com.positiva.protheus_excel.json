@@ -1,0 +1,9 @@
+{
+    "name":  "com.positiva.protheus_excel",
+    "description":  "Positiva Protheus - leitura e atualizacao segura de arquivos locais",
+    "path":  "C:\\Users\\Alexandre Mallorca\\Documents\\Projetos TI\\ProtheusAutomations\\helper\\Positiva.ProtheusExcelHost.exe",
+    "type":  "stdio",
+    "allowed_origins":  [
+                            "chrome-extension://cmaccnmlcnadcjclgbpneenhkheolnlo/"
+                        ]
+}
