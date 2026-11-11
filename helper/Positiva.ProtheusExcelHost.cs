@@ -146,119 +146,103 @@ public static class PositivaProtheusExcelHost
         if (!Directory.Exists(directory))
             throw new DirectoryNotFoundException("Pasta do ISS Corretora não encontrada: " + directory);
 
-        Regex filePattern = new Regex(@"^CORRETORA_GUIA_ISS_DAMSP_58345965_(\d{6})\.PDF$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-        List<string> candidates = new List<string>();
-        foreach (string path in Directory.GetFiles(directory, "*", SearchOption.TopDirectoryOnly))
+        Regex filePattern = new Regex(@"^CORRETORA_(?:GUIA_)?ISS_DAMSP_58345965_(\d{6})\.PDF$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        var candidates = new List<KeyValuePair<string, string>>();
+        foreach (string path in Directory.GetFiles(directory, "*.pdf", SearchOption.TopDirectoryOnly))
         {
             string name = Path.GetFileName(path);
             Match match = filePattern.Match(name);
             if (!match.Success) continue;
             string period = match.Groups[1].Value;
+            int year, month;
+            if (!int.TryParse(period.Substring(0, 4), NumberStyles.None, CultureInfo.InvariantCulture, out year) ||
+                !int.TryParse(period.Substring(4, 2), NumberStyles.None, CultureInfo.InvariantCulture, out month) || month < 1 || month > 12) continue;
             if (requestedPeriod.Length > 0 && !string.Equals(period, requestedPeriod, StringComparison.Ordinal)) continue;
-            candidates.Add(path);
+            candidates.Add(new KeyValuePair<string, string>(path, period));
         }
 
-        candidates.Sort(StringComparer.OrdinalIgnoreCase);
         if (candidates.Count == 0)
         {
             string suffix = requestedPeriod.Length > 0 ? " para a competência " + requestedPeriod : "";
             throw new FileNotFoundException("PDF do ISS Corretora não encontrado" + suffix + " em: " + directory);
         }
-        if (candidates.Count > 1)
+
+        string selectedPeriod = requestedPeriod;
+        if (selectedPeriod.Length == 0)
+            selectedPeriod = candidates.Select(item => item.Value).OrderByDescending(value => value, StringComparer.Ordinal).First();
+
+        List<string> selected = candidates.Where(item => item.Value == selectedPeriod).Select(item => item.Key).OrderBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase).ToList();
+        if (selected.Count != 1)
         {
-            string names = string.Join(", ", candidates.Select(path => Path.GetFileName(path)).ToArray());
-            throw new InvalidOperationException("ISS Corretora: mais de um PDF compatível foi encontrado. Informe/defina a competência antes de continuar. Arquivos: " + names);
+            string names = string.Join(", ", selected.Select(path => Path.GetFileName(path)).ToArray());
+            throw new InvalidOperationException("ISS Corretora: mais de um PDF foi encontrado para a competência " + selectedPeriod + ". Arquivos: " + names);
         }
 
-        string pdfPath = candidates[0];
+        string pdfPath = selected[0];
         string fileName = Path.GetFileName(pdfPath);
-        Match selectedMatch = filePattern.Match(fileName);
-        string selectedPeriod = selectedMatch.Groups[1].Value;
-        int month;
-        int year;
-        if (!int.TryParse(selectedPeriod.Substring(0, 4), NumberStyles.None, CultureInfo.InvariantCulture, out year) ||
-            !int.TryParse(selectedPeriod.Substring(4, 2), NumberStyles.None, CultureInfo.InvariantCulture, out month) ||
-            month < 1 || month > 12)
-            throw new InvalidOperationException("Competência inválida no nome do PDF do ISS Corretora: " + selectedPeriod);
-
         byte[] bytes = File.ReadAllBytes(pdfPath);
-        if (bytes == null || bytes.Length == 0)
-            throw new InvalidDataException("PDF do ISS Corretora está vazio: " + pdfPath);
+        if (bytes == null || bytes.Length == 0) throw new InvalidDataException("PDF do ISS Corretora está vazio: " + pdfPath);
 
         return new Dictionary<string, object>
         {
-            { "ok", true },
-            { "period", selectedPeriod },
-            { "pdfPath", pdfPath },
-            { "pdfName", fileName },
-            { "pdfBase64", Convert.ToBase64String(bytes) },
-            { "reader", "direct-bytes" }
+            { "ok", true }, { "period", selectedPeriod }, { "pdfPath", pdfPath }, { "pdfName", fileName },
+            { "pdfBase64", Convert.ToBase64String(bytes) }, { "reader", "direct-bytes" }
         };
     }
 
     private static Dictionary<string, object> ReadIssCorretoraCsvSources(Dictionary<string, object> request)
     {
         string period = GetString(request, "period").Trim();
-        if (!Regex.IsMatch(period, @"^\d{6}$"))
-            throw new InvalidOperationException("Período dos CSVs do ISS Corretora inválido. Esperado AAAAMM: " + period);
+        if (!Regex.IsMatch(period, @"^\d{6}$")) throw new InvalidOperationException("Período dos CSVs do ISS Corretora inválido. Esperado AAAAMM: " + period);
 
-        int year;
-        int month;
+        int year, month;
         if (!int.TryParse(period.Substring(0, 4), NumberStyles.None, CultureInfo.InvariantCulture, out year) ||
-            !int.TryParse(period.Substring(4, 2), NumberStyles.None, CultureInfo.InvariantCulture, out month) ||
-            month < 1 || month > 12)
+            !int.TryParse(period.Substring(4, 2), NumberStyles.None, CultureInfo.InvariantCulture, out month) || month < 1 || month > 12)
             throw new InvalidOperationException("Competência inválida para os CSVs do ISS Corretora: " + period);
 
         string directory = GetString(request, "directory").Trim();
         if (directory.Length == 0) directory = DefaultIssCorretoraDirectory;
-        if (!Directory.Exists(directory))
-            throw new DirectoryNotFoundException("Pasta do ISS Corretora não encontrada: " + directory);
+        if (!Directory.Exists(directory)) throw new DirectoryNotFoundException("Pasta do ISS Corretora não encontrada: " + directory);
 
-        string startDate = period + "01";
-        string endDate = period + DateTime.DaysInMonth(year, month).ToString("00", CultureInfo.InvariantCulture);
-        string nfseEName = "NFSe_E_58345965_" + startDate + "_" + endDate + ".csv";
-        string nfseName = "NFSe_58345965_" + startDate + "_" + endDate + ".csv";
-        string nfseEPath = Path.Combine(directory, nfseEName);
-        string nfsePath = Path.Combine(directory, nfseName);
+        Regex csvPattern = new Regex(@"^(NFSe(?:_E)?)_58345965_(\d{8})_(\d{8})\.csv$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        string nfseEPath = null, nfsePath = null;
+        foreach (string path in Directory.GetFiles(directory, "*.csv", SearchOption.TopDirectoryOnly))
+        {
+            string name = Path.GetFileName(path);
+            Match match = csvPattern.Match(name);
+            if (!match.Success) continue;
+            string startPeriod = match.Groups[2].Value.Substring(0, 6);
+            string endPeriod = match.Groups[3].Value.Substring(0, 6);
+            if (startPeriod != period || endPeriod != period) continue;
 
-        if (!File.Exists(nfseEPath))
-            throw new FileNotFoundException("CSV NFSe_E do ISS Corretora não encontrado: " + nfseEPath, nfseEPath);
-        if (!File.Exists(nfsePath))
-            throw new FileNotFoundException("CSV NFSe do ISS Corretora não encontrado: " + nfsePath, nfsePath);
+            bool isNfseE = string.Equals(match.Groups[1].Value, "NFSe_E", StringComparison.OrdinalIgnoreCase);
+            if (isNfseE)
+            {
+                if (nfseEPath != null) throw new InvalidOperationException("ISS Corretora: mais de um CSV NFSe_E foi encontrado para a competência " + period + ".");
+                nfseEPath = path;
+            }
+            else
+            {
+                if (nfsePath != null) throw new InvalidOperationException("ISS Corretora: mais de um CSV NFSe foi encontrado para a competência " + period + ".");
+                nfsePath = path;
+            }
+        }
 
+        if (string.IsNullOrEmpty(nfseEPath)) throw new FileNotFoundException("CSV NFSe_E do ISS Corretora não encontrado para a competência " + period + " em: " + directory);
+        if (string.IsNullOrEmpty(nfsePath)) throw new FileNotFoundException("CSV NFSe do ISS Corretora não encontrado para a competência " + period + " em: " + directory);
+
+        string nfseEName = Path.GetFileName(nfseEPath), nfseName = Path.GetFileName(nfsePath);
         Encoding sourceEncoding = Encoding.GetEncoding(1252);
-        string nfseEText = File.ReadAllText(nfseEPath, sourceEncoding);
-        string nfseText = File.ReadAllText(nfsePath, sourceEncoding);
-        if (string.IsNullOrWhiteSpace(nfseEText))
-            throw new InvalidDataException("CSV NFSe_E do ISS Corretora está vazio: " + nfseEPath);
-        if (string.IsNullOrWhiteSpace(nfseText))
-            throw new InvalidDataException("CSV NFSe do ISS Corretora está vazio: " + nfsePath);
+        string nfseEText = File.ReadAllText(nfseEPath, sourceEncoding), nfseText = File.ReadAllText(nfsePath, sourceEncoding);
+        if (string.IsNullOrWhiteSpace(nfseEText)) throw new InvalidDataException("CSV NFSe_E do ISS Corretora está vazio: " + nfseEPath);
+        if (string.IsNullOrWhiteSpace(nfseText)) throw new InvalidDataException("CSV NFSe do ISS Corretora está vazio: " + nfsePath);
 
         object[] sources = new object[]
         {
-            new Dictionary<string, object>
-            {
-                { "sourceType", "NFSe_E" },
-                { "fileName", nfseEName },
-                { "filePath", nfseEPath },
-                { "csvText", nfseEText }
-            },
-            new Dictionary<string, object>
-            {
-                { "sourceType", "NFSe" },
-                { "fileName", nfseName },
-                { "filePath", nfsePath },
-                { "csvText", nfseText }
-            }
+            new Dictionary<string, object> { { "sourceType", "NFSe_E" }, { "fileName", nfseEName }, { "filePath", nfseEPath }, { "csvText", nfseEText } },
+            new Dictionary<string, object> { { "sourceType", "NFSe" }, { "fileName", nfseName }, { "filePath", nfsePath }, { "csvText", nfseText } }
         };
-
-        return new Dictionary<string, object>
-        {
-            { "ok", true },
-            { "period", period },
-            { "csvSources", sources },
-            { "reader", "csv-semicolon-windows-1252" }
-        };
+        return new Dictionary<string, object> { { "ok", true }, { "period", period }, { "csvSources", sources }, { "reader", "csv-semicolon-windows-1252" } };
     }
 
     private static Dictionary<string, object> ReadSoomarExpenses(Dictionary<string, object> request)

@@ -1,7 +1,7 @@
 (() => {
   if (window.top !== window) return;
 
-  const EXTENSION_VERSION = '5.7.8';
+  const EXTENSION_VERSION = '5.15.7';
   const existingRuntime = window.__PosProtheusContentRuntime;
   const sameVersion = !!(existingRuntime && existingRuntime.initialized === true && existingRuntime.version === EXTENSION_VERSION);
   if (sameVersion) return; // same-version reinjection
@@ -324,26 +324,63 @@
   }
 
 
-  async function sendTrustedClick(element) {
+  function markIssTrustedTarget(element, protectInput) {
+    const native = api.getNativeActionTarget(element);
+    if (!native || !native.isConnected || typeof native.getRootNode !== 'function') throw new Error('ISS: alvo desconectado.');
+    const host = native.getRootNode().host;
+    if (!host) throw new Error('ISS: controle nativo sem host identificado.');
+    const attr = 'data-pos-protheus-target';
+    const previous = native.getAttribute(attr);
+    const token = 'iss-' + crypto.randomUUID();
+    const events = protectInput ? api.armIssInputEventGuard(element) : null;
+    native.setAttribute(attr, token);
+    return {
+      blocked: () => !!events && events.blocked(),
+      expectedTarget: {
+        token,
+        hostId: host.getAttribute('id'),
+        hostType: host.getAttribute('type') || '',
+        hostPicture: host.getAttribute('picture') || '',
+        hostName: host.getAttribute('name') || '',
+        ensureChecked: !protectInput && String(host.tagName || '').toUpperCase() === 'WA-CHECKBOX',
+        value: String(native.value),
+        selectionStart: native.selectionStart,
+        selectionEnd: native.selectionEnd,
+        ensureVisible: true
+      },
+      release() {
+        if (events) events.release();
+        if (native.getAttribute(attr) !== token) return;
+        if (previous === null) native.removeAttribute(attr);
+        else native.setAttribute(attr, previous);
+      }
+    };
+  }
+
+  async function sendTrustedClick(element, options) {
+    let guard = null;
     try {
       if (!element) return false;
       const nativeTarget = api && typeof api.getNativeActionTarget === 'function' ? api.getNativeActionTarget(element) : element;
       if (!nativeTarget || typeof nativeTarget.getBoundingClientRect !== 'function') return false;
+      const anchor = options && options.issGuard ? api.getIssTrustedClickAnchor(element) : nativeTarget;
+      if (!anchor || typeof anchor.getBoundingClientRect !== 'function') return false;
       try {
-        if (typeof nativeTarget.scrollIntoView === 'function') nativeTarget.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        if (typeof anchor.scrollIntoView === 'function') anchor.scrollIntoView({ block: 'nearest', inline: 'nearest' });
       } catch (_) {}
       try {
-        if (typeof nativeTarget.focus === 'function') {
+        if (!(options && options.issGuard) && typeof nativeTarget.focus === 'function') {
           try { nativeTarget.focus({ preventScroll: true }); } catch (_) { try { nativeTarget.focus(); } catch (_) {} }
         }
       } catch (_) {}
-      const rect = nativeTarget.getBoundingClientRect();
+      const rect = anchor.getBoundingClientRect();
       const x = Number(rect && rect.left) + (Number(rect && rect.width) / 2);
       const y = Number(rect && rect.top) + (Number(rect && rect.height) / 2);
       if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+      if (options && options.issGuard) guard = markIssTrustedTarget(element);
 
       const response = await new Promise((resolve) => {
-        chrome.runtime.sendMessage({ type: 'pos-protheus-trusted-click', x, y }, (result) => {
+        chrome.runtime.sendMessage({ type: 'pos-protheus-trusted-click', x, y, expectedTarget: guard && guard.expectedTarget }, (result) => {
           const runtimeError = chrome.runtime && chrome.runtime.lastError;
           if (runtimeError) {
             resolve({ ok: false, error: runtimeError.message || 'Falha no clique confiável.' });
@@ -357,6 +394,36 @@
     } catch (error) {
       diagnosticLogger.log('TRUSTED_CLICK_FAIL', 'Falha ao executar clique confiável via Edge/CDP.', { message: String(error && error.message || error) });
       return false;
+    } finally {
+      if (guard) guard.release();
+    }
+  }
+
+  async function sendTrustedHover(element) {
+    let guard = null;
+    try {
+      if (!element) return false;
+      const anchor = api.getIssTrustedClickAnchor(element);
+      if (!anchor || typeof anchor.getBoundingClientRect !== 'function') return false;
+      guard = markIssTrustedTarget(element);
+      const rect = anchor.getBoundingClientRect();
+      const x = Number(rect && rect.left) + (Number(rect && rect.width) / 2);
+      const y = Number(rect && rect.top) + (Number(rect && rect.height) / 2);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+      const response = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: 'pos-protheus-trusted-hover', x, y, expectedTarget: guard.expectedTarget }, (result) => {
+          const runtimeError = chrome.runtime && chrome.runtime.lastError;
+          resolve(runtimeError ? { ok: false, error: runtimeError.message || 'Falha no hover confiável.' } :
+            (result || { ok: false, error: 'Sem resposta do service worker.' }));
+        });
+      });
+      diagnosticLogger.log('TRUSTED_HOVER', 'Resultado do hover confiável via Edge/CDP.', response);
+      return !!(response && response.ok === true);
+    } catch (error) {
+      diagnosticLogger.log('TRUSTED_HOVER_FAIL', 'Falha ao executar hover confiável via Edge/CDP.', { message: String(error && error.message || error) });
+      return false;
+    } finally {
+      if (guard) guard.release();
     }
   }
 
@@ -392,10 +459,12 @@
     }
   }
 
-  async function sendTrustedKey(key) {
+  async function sendTrustedKey(key, expectedControl) {
+    let guard = null;
     try {
+      if (expectedControl) guard = markIssTrustedTarget(expectedControl, true);
       const response = await new Promise((resolve) => {
-        chrome.runtime.sendMessage({ type: 'pos-protheus-trusted-key', key: String(key || '') }, (result) => {
+        chrome.runtime.sendMessage({ type: 'pos-protheus-trusted-key', key: String(key || ''), expectedTarget: guard && guard.expectedTarget }, (result) => {
           const runtimeError = chrome.runtime && chrome.runtime.lastError;
           if (runtimeError) {
             resolve({ ok: false, error: runtimeError.message || 'Falha na tecla confiável.' });
@@ -405,17 +474,22 @@
         });
       });
       diagnosticLogger.log('TRUSTED_KEY', 'Resultado da tecla confiável via Edge/CDP.', response);
-      return !!(response && response.ok === true);
+      if (guard && guard.blocked()) diagnosticLogger.log('ISS_INPUT_GUARD_BLOCKED', 'Evento de tecla bloqueado antes de atingir outro campo.');
+      return !!(response && response.ok === true) && !(guard && guard.blocked());
     } catch (error) {
       diagnosticLogger.log('TRUSTED_KEY_FAIL', 'Falha ao executar tecla confiável via Edge/CDP.', { message: String(error && error.message || error), key: String(key || '') });
       return false;
+    } finally {
+      if (guard) guard.release();
     }
   }
 
-  async function sendTrustedText(text) {
+  async function sendTrustedText(text, expectedControl) {
+    let guard = null;
     try {
+      if (expectedControl) guard = markIssTrustedTarget(expectedControl, true);
       const response = await new Promise((resolve) => {
-        chrome.runtime.sendMessage({ type: 'pos-protheus-trusted-text', text: String(text == null ? '' : text) }, (result) => {
+        chrome.runtime.sendMessage({ type: 'pos-protheus-trusted-text', text: String(text == null ? '' : text), expectedTarget: guard && guard.expectedTarget }, (result) => {
           const runtimeError = chrome.runtime && chrome.runtime.lastError;
           if (runtimeError) {
             resolve({ ok: false, error: runtimeError.message || 'Falha na digitação confiável.' });
@@ -425,10 +499,13 @@
         });
       });
       diagnosticLogger.log('TRUSTED_TEXT', 'Resultado da digitação confiável via Edge/CDP.', response);
-      return !!(response && response.ok === true);
+      if (guard && guard.blocked()) diagnosticLogger.log('ISS_INPUT_GUARD_BLOCKED', 'Evento de texto bloqueado antes de atingir outro campo.');
+      return !!(response && response.ok === true) && !(guard && guard.blocked());
     } catch (error) {
       diagnosticLogger.log('TRUSTED_TEXT_FAIL', 'Falha ao executar digitação confiável via Edge/CDP.', { message: String(error && error.message || error) });
       return false;
+    } finally {
+      if (guard) guard.release();
     }
   }
 
@@ -1575,7 +1652,7 @@
 
   const onUserClickDiagnostic = (event) => {
     if (!event || event.isTrusted !== true || !diagnosticLogger.isActive()) return;
-    diagnosticLogger.log('USER_CLICK', 'Clique do usuário dentro do Protheus.', {
+    diagnosticLogger.log('BROWSER_CLICK', 'Clique observado no Protheus (pode ser manual ou enviado via CDP).', {
       target: diagnosticApi.describeEventTarget(event),
       state: runtimeState()
     });
@@ -1583,7 +1660,7 @@
 
   const onUserKeyDiagnostic = (event) => {
     if (!event || event.isTrusted !== true || !diagnosticLogger.isActive()) return;
-    diagnosticLogger.log('USER_KEY', 'Tecla do usuário dentro do Protheus.', Object.assign(
+    diagnosticLogger.log('BROWSER_KEY', 'Tecla observada no Protheus (pode ser manual ou enviada via CDP).', Object.assign(
       { target: diagnosticApi.describeEventTarget(event), state: runtimeState() },
       diagnosticApi.sanitizeKeyboardEvent(event)
     ));
@@ -2593,6 +2670,180 @@
     }
   }
 
+  function showIssCorretoraRunOptions() {
+    return new Promise((resolve) => {
+      const existing = document.getElementById('positiva-iss-corretora-options-modal');
+      if (existing) existing.remove();
+
+      const backdrop = document.createElement('div');
+      backdrop.id = 'positiva-iss-corretora-options-modal';
+      Object.assign(backdrop.style, {
+        position: 'fixed', inset: '0', zIndex: '2147483647', background: 'rgba(15, 27, 34, .48)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px', boxSizing: 'border-box'
+      });
+
+      const card = document.createElement('div');
+      card.setAttribute('role', 'dialog');
+      card.setAttribute('aria-modal', 'true');
+      card.setAttribute('aria-label', 'Opções do ISS Corretora');
+      Object.assign(card.style, {
+        width: 'min(500px, 94vw)', background: '#fff', borderRadius: '12px',
+        boxShadow: '0 22px 70px rgba(0,0,0,.32)', padding: '18px', boxSizing: 'border-box',
+        fontFamily: 'Arial, sans-serif'
+      });
+
+      const title = document.createElement('div');
+      title.textContent = 'Opções do ISS Corretora';
+      Object.assign(title.style, { fontSize: '17px', fontWeight: '700', color: '#173847' });
+      const subtitle = document.createElement('div');
+      subtitle.textContent = 'Escolha as tabelas e, se desejar, execute a baixa dos títulos pendentes.';
+      Object.assign(subtitle.style, { marginTop: '5px', marginBottom: '14px', fontSize: '12px', color: '#617580' });
+
+      const createOption = (text) => {
+        const label = document.createElement('label');
+        Object.assign(label.style, {
+          display: 'flex', alignItems: 'center', gap: '9px', padding: '11px 12px', marginBottom: '8px',
+          border: '1px solid #d8e1e6', borderRadius: '9px', background: '#f8fbfd',
+          color: '#203844', fontSize: '13px', cursor: 'pointer', userSelect: 'none'
+        });
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = false;
+        checkbox.style.width = '17px';
+        checkbox.style.height = '17px';
+        checkbox.style.accentColor = '#0079b8';
+        const optionText = document.createElement('span');
+        optionText.textContent = text;
+        label.appendChild(checkbox);
+        label.appendChild(optionText);
+        return { label, checkbox };
+      };
+
+      const guideOption = createOption('Mostrar conferência da guia ISS');
+      const protheusOption = createOption('Mostrar registros encontrados no Protheus');
+      const settlementOption = createOption('Baixar em sequência todos os títulos SIM ainda pendentes (banco 033, motivo DÉBITO CC)');
+      const pauseDateOption = createOption('Pausar no Vencto Real para eu informar a data manualmente');
+      const afterFilterOption = createOption('Começar após aplicação do filtro (filtro já aplicado no Protheus)');
+
+      const syncPauseDateAvailability = () => {
+        const disabled = afterFilterOption.checkbox.checked === true;
+        pauseDateOption.checkbox.disabled = disabled;
+        if (disabled) pauseDateOption.checkbox.checked = false;
+        pauseDateOption.label.style.opacity = disabled ? '.55' : '1';
+        pauseDateOption.label.style.cursor = disabled ? 'default' : 'pointer';
+      };
+      afterFilterOption.checkbox.addEventListener('change', syncPauseDateAvailability);
+      syncPauseDateAvailability();
+
+      const actions = document.createElement('div');
+      Object.assign(actions.style, { display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '16px' });
+      const cancel = document.createElement('button');
+      cancel.type = 'button';
+      cancel.textContent = 'Cancelar';
+      const start = document.createElement('button');
+      start.type = 'button';
+      start.textContent = 'Iniciar';
+      for (const button of [cancel, start]) {
+        Object.assign(button.style, {
+          minWidth: '86px', height: '36px', padding: '0 14px', borderRadius: '8px',
+          fontFamily: 'Arial, sans-serif', fontSize: '12px', fontWeight: '700', cursor: 'pointer'
+        });
+      }
+      Object.assign(cancel.style, { border: '1px solid #cbd6dc', background: '#fff', color: '#304650' });
+      Object.assign(start.style, { border: '1px solid #0079b8', background: '#0079b8', color: '#fff' });
+      actions.appendChild(cancel);
+      actions.appendChild(start);
+
+      card.appendChild(title);
+      card.appendChild(subtitle);
+      card.appendChild(guideOption.label);
+      card.appendChild(protheusOption.label);
+      card.appendChild(settlementOption.label);
+      card.appendChild(pauseDateOption.label);
+      card.appendChild(afterFilterOption.label);
+      card.appendChild(actions);
+      backdrop.appendChild(card);
+      document.body.appendChild(backdrop);
+
+      let finished = false;
+      const finish = (value) => {
+        if (finished) return;
+        finished = true;
+        if (backdrop.isConnected) backdrop.remove();
+        resolve(value);
+      };
+      cancel.addEventListener('click', () => finish(null));
+      start.addEventListener('click', () => finish({
+        showGuideConference: guideOption.checkbox.checked === true,
+        showProtheusRecords: protheusOption.checkbox.checked === true,
+        settleAllRecords: settlementOption.checkbox.checked === true,
+        pauseAtDueDate: pauseDateOption.checkbox.checked === true,
+        startAfterFilter: afterFilterOption.checkbox.checked === true
+      }));
+      backdrop.addEventListener('click', (event) => { if (event.target === backdrop) finish(null); });
+      try { start.focus(); } catch (_) {}
+    });
+  }
+
+  function showIssCorretoraManualDatePause(data, signal) {
+    return new Promise((resolve) => {
+      const existing = document.getElementById('positiva-iss-corretora-date-pause');
+      if (existing) existing.remove();
+
+      const panel = document.createElement('div');
+      panel.id = 'positiva-iss-corretora-date-pause';
+      panel.setAttribute('role', 'dialog');
+      panel.setAttribute('aria-label', 'ISS Corretora – Pausa no Vencto Real');
+      Object.assign(panel.style, {
+        position: 'fixed', right: '24px', top: '86px', zIndex: '2147483647',
+        width: 'min(350px, calc(100vw - 48px))', padding: '15px 16px', boxSizing: 'border-box',
+        background: '#fff', border: '1px solid #cbd8df', borderRadius: '12px',
+        boxShadow: '0 16px 48px rgba(0,0,0,.28)', fontFamily: 'Arial, sans-serif', color: '#203844'
+      });
+
+      const title = document.createElement('div');
+      title.textContent = 'Rotina pausada no Vencto Real';
+      Object.assign(title.style, { fontSize: '15px', fontWeight: '700', color: '#173847' });
+
+      const text = document.createElement('div');
+      text.textContent = 'Digite a data desejada diretamente no campo Vencto Real do Protheus e depois clique em Continuar.';
+      Object.assign(text.style, { marginTop: '7px', fontSize: '12px', lineHeight: '1.45', color: '#536b77' });
+
+      const suggested = document.createElement('div');
+      suggested.textContent = 'Data automática seria: ' + String(data && data.suggestedValue || '');
+      Object.assign(suggested.style, { marginTop: '8px', fontSize: '11px', color: '#7a8d96' });
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = 'Continuar';
+      Object.assign(button.style, {
+        display: 'block', marginLeft: 'auto', marginTop: '13px', minWidth: '100px', height: '36px',
+        padding: '0 16px', border: '1px solid #0079b8', borderRadius: '8px',
+        background: '#0079b8', color: '#fff', fontWeight: '700', cursor: 'pointer'
+      });
+
+      panel.appendChild(title);
+      panel.appendChild(text);
+      panel.appendChild(suggested);
+      panel.appendChild(button);
+      document.body.appendChild(panel);
+
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        if (signal && typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', finish);
+        if (panel.isConnected) panel.remove();
+        resolve();
+      };
+      button.addEventListener('click', finish);
+      if (signal && typeof signal.addEventListener === 'function') {
+        if (signal.aborted) finish();
+        else signal.addEventListener('abort', finish, { once: true });
+      }
+    });
+  }
+
   function showIssCorretoraConference(data, signal) {
     return new Promise((resolve) => {
       const existing = document.getElementById('positiva-iss-corretora-conference-modal');
@@ -2752,7 +3003,223 @@
     });
   }
 
-  async function runIssCorretoraRoutine(item, routine) {
+  function showIssProtheusResults(data, signal) {
+    return new Promise((resolve) => {
+      const existing = document.getElementById('positiva-iss-protheus-results-modal');
+      if (existing) existing.remove();
+
+      const records = data && Array.isArray(data.records) ? data.records : [];
+      const summaryData = data && data.summary ? data.summary : api.buildIssProtheusRecordsSummary(records);
+      const reconciliation = data && data.reconciliation && data.reconciliation.summary
+        ? data.reconciliation.summary
+        : {
+            matchedCount: 0, matchedValueCents: 0, exactMatchedCount: 0, oneCentMatchedCount: 0,
+            notFoundCount: 0, notFoundValueCents: 0, unmatchedMunicipalCount: 0, unmatchedMunicipalValueCents: 0,
+            guideTotalCents: 0, directSettlementValueCents: 0, subsetTargetCents: 0,
+            subsetSelectedCount: 0, subsetSelectedValueCents: 0, subsetResidualCents: 0
+          };
+      const money = (cents) => {
+        const value = Math.trunc(Number(cents) || 0);
+        const absolute = Math.abs(value);
+        const integer = String(Math.floor(absolute / 100)).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+        return (value < 0 ? '-R$ ' : 'R$ ') + integer + ',' + String(absolute % 100).padStart(2, '0');
+      };
+
+      const backdrop = document.createElement('div');
+      backdrop.id = 'positiva-iss-protheus-results-modal';
+      Object.assign(backdrop.style, {
+        position: 'fixed', inset: '0', zIndex: '2147483647', background: 'rgba(15, 27, 34, .48)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px', boxSizing: 'border-box'
+      });
+
+      const card = document.createElement('div');
+      card.setAttribute('role', 'dialog');
+      card.setAttribute('aria-modal', 'true');
+      card.setAttribute('aria-label', 'ISS Corretora – Registros encontrados no Protheus');
+      Object.assign(card.style, {
+        width: 'min(1500px, 97vw)', maxHeight: '92vh', background: '#fff', borderRadius: '12px',
+        boxShadow: '0 22px 70px rgba(0,0,0,.32)', padding: '18px', boxSizing: 'border-box',
+        fontFamily: 'Arial, sans-serif', display: 'flex', flexDirection: 'column', gap: '12px', overflow: 'hidden'
+      });
+
+      const title = document.createElement('div');
+      title.textContent = 'ISS Corretora – Registros encontrados no Protheus';
+      Object.assign(title.style, { fontSize: '17px', fontWeight: '700', color: '#173847' });
+
+      const subtitle = document.createElement('div');
+      subtitle.textContent = 'Filtro aplicado e grade carregada. Confira o resumo e os títulos antes de continuar.';
+      Object.assign(subtitle.style, { fontSize: '12px', color: '#617580', marginTop: '-5px' });
+
+      const fieldsRow = document.createElement('div');
+      Object.assign(fieldsRow.style, {
+        display: 'flex', flexDirection: 'column', gap: '8px', width: '100%'
+      });
+      const summarySections = api.buildIssProtheusSummarySections(summaryData, reconciliation);
+      const settlementTones = {
+        blue: ['#eef7ff', '#1681c4'], green: ['#eef9f2', '#24854d'], amber: ['#fff8e8', '#c88612'],
+        purple: ['#f5efff', '#7b4bc4'], slate: ['#f2f6f8', '#627985']
+      };
+      summarySections.forEach((sectionData) => {
+        const section = document.createElement('section');
+        section.setAttribute('data-summary-section', sectionData.id);
+        Object.assign(section.style, {
+          border: '1px solid #d8e1e6', borderRadius: '9px', background: '#f8fbfd', padding: '8px 10px', boxSizing: 'border-box'
+        });
+        const sectionTitle = document.createElement('div');
+        sectionTitle.textContent = sectionData.title;
+        Object.assign(sectionTitle.style, {
+          color: '#506975', fontSize: '10px', fontWeight: '700', letterSpacing: '.35px',
+          textTransform: 'uppercase', marginBottom: '6px'
+        });
+        const sectionGrid = document.createElement('div');
+        const minimumWidth = sectionData.id === 'settlement' ? '170px' : (sectionData.id === 'conference' ? '190px' : '130px');
+        Object.assign(sectionGrid.style, {
+          display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(' + minimumWidth + ', 1fr))', gap: '6px'
+        });
+        sectionData.items.forEach((item) => {
+          const box = document.createElement('div');
+          const tone = settlementTones[item.tone] || ['transparent', '#c7d4da'];
+          Object.assign(box.style, {
+            minWidth: '0', padding: sectionData.id === 'settlement' ? '7px 10px' : '5px 9px',
+            borderLeft: (sectionData.id === 'settlement' ? '4px' : '1px') + ' solid ' + tone[1],
+            borderRadius: '6px', background: sectionData.id === 'settlement' ? tone[0] : 'transparent', boxSizing: 'border-box'
+          });
+          const label = document.createElement('div');
+          label.textContent = String(item.label);
+          Object.assign(label.style, { fontSize: '10.5px', fontWeight: '700', color: '#617580', marginBottom: '3px' });
+          const value = document.createElement('div');
+          const hasCents = Object.prototype.hasOwnProperty.call(item, 'valueCents');
+          value.textContent = hasCents ? money(item.valueCents) : String(item.value == null ? '—' : item.value);
+          Object.assign(value.style, {
+            fontSize: sectionData.id === 'settlement' ? '16px' : '14px', fontWeight: '700', color: '#17313f',
+            whiteSpace: 'normal', overflowWrap: 'break-word', lineHeight: '1.2'
+          });
+          box.appendChild(label);
+          box.appendChild(value);
+          if (item.detail || Object.prototype.hasOwnProperty.call(item, 'detailCents')) {
+            const detail = document.createElement('div');
+            detail.textContent = item.detail || money(item.detailCents);
+            Object.assign(detail.style, { fontSize: '11px', color: '#617580', marginTop: '3px', whiteSpace: 'normal' });
+            box.appendChild(detail);
+          }
+          sectionGrid.appendChild(box);
+        });
+        section.appendChild(sectionTitle);
+        section.appendChild(sectionGrid);
+        fieldsRow.appendChild(section);
+      });
+
+      const tableWrap = document.createElement('div');
+      Object.assign(tableWrap.style, {
+        minHeight: '180px', maxHeight: '520px', overflow: 'auto', border: '1px solid #d8e1e6', borderRadius: '9px'
+      });
+      const table = document.createElement('table');
+      Object.assign(table.style, { width: '100%', borderCollapse: 'collapse', fontSize: '12px', color: '#17313f' });
+      const columns = [
+        ['Prefixo', 'prefix'], ['No. Título', 'title'], ['Parcela', 'installment'], ['Tipo', 'type'],
+        ['Fornecedor', 'supplier'], ['Loja', 'store'], ['Nome fornecedor', 'supplierName'], ['Natureza', 'nature'],
+        ['DT Emissão', 'issueDate'], ['Vencto real', 'actualDueDate'], ['Vlr. título', 'titleValueCents'],
+        ['Valor Prefeitura', 'municipalIssDueCents'], ['Diferença', 'municipalDifferenceCents'],
+        ['NFS-e Prefeitura', 'municipalNfseNumber'],
+        ['Situação Prefeitura', 'municipalMatchStatus'], ['Dar baixa', 'shouldSettle']
+      ];
+      const thead = document.createElement('thead');
+      const headerRow = document.createElement('tr');
+      columns.forEach(([labelText], index) => {
+        const th = document.createElement('th');
+        th.textContent = labelText;
+        Object.assign(th.style, {
+          position: 'sticky', top: '0', zIndex: '1', background: '#edf4f7', padding: '8px 10px',
+          borderBottom: '1px solid #d8e1e6', textAlign: index === columns.length - 1 ? 'right' : 'left',
+          fontWeight: '700', whiteSpace: 'nowrap', userSelect: 'text'
+        });
+        headerRow.appendChild(th);
+      });
+      thead.appendChild(headerRow);
+      table.appendChild(thead);
+
+      const tbody = document.createElement('tbody');
+      const matchStatusText = (record) => {
+        if (record.settlementSource === 'subset') return 'Selecionado por subconjunto';
+        if (record.municipalMatchKind === 'one-cent') return 'Encontrado (diferença de 1 centavo)';
+        if (record.municipalMatchKind === 'exact') return 'Encontrado (exato)';
+        if (record.municipalMatchStatus === 'not-found') return 'Não encontrado';
+        return 'Não se aplica';
+      };
+      records.forEach((record, rowIndex) => {
+        const tr = document.createElement('tr');
+        if (record.settlementSource === 'subset') tr.style.background = '#f3e8ff';
+        else if (record.municipalMatchKind === 'one-cent') tr.style.background = '#eaf4ff';
+        else if (record.municipalMatchStatus === 'matched') tr.style.background = '#eaf7ee';
+        else if (record.municipalMatchStatus === 'not-found') tr.style.background = '#fff5e8';
+        else if (rowIndex % 2 === 1) tr.style.background = '#f8fbfd';
+        columns.forEach(([, key], columnIndex) => {
+          const td = document.createElement('td');
+          if (key === 'titleValueCents') td.textContent = money(record[key]);
+          else if (key === 'municipalIssDueCents') td.textContent = record.municipalMatchStatus === 'matched' ? money(record[key]) : '—';
+          else if (key === 'municipalDifferenceCents') td.textContent = record.municipalMatchStatus === 'matched' ? money(record[key]) : '—';
+          else if (key === 'municipalMatchStatus') td.textContent = matchStatusText(record);
+          else if (key === 'shouldSettle') td.textContent = record.municipalMatchStatus === 'not-applicable' ? '—' :
+            (record[key] === true ? (/^\d{2}\/\d{2}\/\d{4}$/.test(String(record.settlementDate || '').trim()) ? 'JÁ BAIXADO' : 'SIM') : 'NÃO');
+          else td.textContent = String(record[key] == null || record[key] === '' ? '—' : record[key]);
+          Object.assign(td.style, {
+            padding: '7px 10px', borderBottom: '1px solid #edf1f3', whiteSpace: 'nowrap',
+            textAlign: key === 'titleValueCents' || key === 'municipalIssDueCents' || key === 'municipalDifferenceCents' ? 'right' : 'left',
+            userSelect: 'text', cursor: 'text'
+          });
+          if (key === 'shouldSettle') {
+            td.style.fontWeight = '700';
+            td.style.color = record.municipalMatchStatus === 'not-applicable' ? '#617580' : (record[key] === true ? '#19743b' : '#7a4d17');
+          }
+          if (key === 'municipalDifferenceCents' && record.municipalMatchKind === 'one-cent') {
+            td.style.fontWeight = '700';
+            td.style.color = '#005f9e';
+          }
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      tableWrap.appendChild(table);
+
+      const actions = document.createElement('div');
+      Object.assign(actions.style, { display: 'flex', justifyContent: 'flex-end' });
+      const close = document.createElement('button');
+      close.type = 'button';
+      close.textContent = 'Continuar';
+      Object.assign(close.style, {
+        minWidth: '92px', height: '36px', border: '1px solid #0079b8', borderRadius: '8px',
+        background: '#0079b8', color: '#fff', fontWeight: '700', cursor: 'pointer'
+      });
+      actions.appendChild(close);
+      card.appendChild(title);
+      card.appendChild(subtitle);
+      card.appendChild(fieldsRow);
+      card.appendChild(tableWrap);
+      card.appendChild(actions);
+      backdrop.appendChild(card);
+      document.body.appendChild(backdrop);
+
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        if (signal && typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', finish);
+        if (backdrop.isConnected) backdrop.remove();
+        resolve();
+      };
+      close.addEventListener('click', finish);
+      backdrop.addEventListener('click', (event) => { if (event.target === backdrop) finish(); });
+      if (signal && typeof signal.addEventListener === 'function') {
+        if (signal.aborted) finish();
+        else signal.addEventListener('abort', finish, { once: true });
+      }
+      try { close.focus(); } catch (_) {}
+    });
+  }
+
+  async function runIssCorretoraRoutine(item, routine, runOptions) {
+    const displayOptions = api.getIssRunDisplayOptions(runOptions);
     const original = routine.label;
     let keepDebugOpenForRecorder = false;
     item.disabled = true;
@@ -2768,7 +3235,14 @@
       visibility: document.visibilityState,
       focus: (() => { try { return document.hasFocus(); } catch (_) { return false; } })(),
       userAgent: String((window.navigator && window.navigator.userAgent) || ''),
-      extra: { href: String((window.location && window.location.href) || ''), trigger: 'menu', routine: 'iss-corretora', stage: 'pdf-identification' }
+      extra: {
+        href: String((window.location && window.location.href) || ''), trigger: 'menu', routine: 'iss-corretora',
+        stage: 'pdf-identification', showGuideConference: displayOptions.showGuideConference,
+        showProtheusRecords: displayOptions.showProtheusRecords,
+        startAfterFilter: displayOptions.startAfterFilter,
+        settleAllRecords: displayOptions.settleAllRecords,
+        pauseAtDueDate: displayOptions.pauseAtDueDate
+      }
     });
 
     try {
@@ -2786,29 +3260,33 @@
 
       const extracted = await api.extractIssGuideFromPdfBase64(rawSource.pdfBase64 || '');
       if (runningController.signal.aborted) throw api.makeAbortError();
-      diagnosticLogger.log('ISS_CORRETORA_PDF_READY', 'PDF do ISS Corretora identificado e número da guia extraído.', {
+      diagnosticLogger.log('ISS_CORRETORA_PDF_READY', 'PDF do ISS Corretora identificado; número e total pago da guia extraídos.', {
         pdfName: rawSource.pdfName || '',
         pdfPath: rawSource.pdfPath || '',
         period: competence.period,
         competence: competence.competenceText,
         guideNumber: extracted.guideNumber,
+        guideTotalCents: extracted.guideTotalCents,
         extractionMethod: extracted.method || '',
         barcodeDigits: extracted.barcodeDigits || ''
       });
 
-      const expectedCsvNames = api.getIssCorretoraCsvFileNames(competence.period);
       const csvSourceResponse = await readIssCorretoraCsvSources(competence.period);
       if (runningController.signal.aborted) throw api.makeAbortError();
       if (csvSourceResponse.period && String(csvSourceResponse.period) !== competence.period) {
         throw new Error('ISS Corretora: a competência retornada para os CSVs diverge do PDF.');
       }
       const csvSources = Array.isArray(csvSourceResponse.csvSources) ? csvSourceResponse.csvSources : [];
-      const returnedNames = csvSources.map((source) => String(source && source.fileName || ''));
-      expectedCsvNames.forEach((name) => {
-        if (!returnedNames.includes(name)) throw new Error('ISS Corretora: CSV esperado não foi retornado pelo helper: ' + name + '.');
+      if (csvSources.length !== 2) throw new Error('ISS Corretora: o helper deve retornar exatamente os dois CSVs da competência.');
+      csvSources.forEach((source) => {
+        const fileName = String(source && source.fileName || '');
+        if (api.getIssCorretoraCsvFilePeriod(fileName) !== competence.period) {
+          throw new Error('ISS Corretora: o CSV ' + fileName + ' não pertence à competência ' + competence.period + '.');
+        }
       });
       const csvAnalysis = api.analyzeIssCorretoraCsvSources(csvSources, extracted.guideNumber);
-      const detail = 'ISS Corretora — Competência: ' + competence.competenceText + ' — Nº da guia: ' + extracted.guideNumber + ' — Registros: ' + csvAnalysis.records.length;
+      const detail = 'ISS Corretora — Competência: ' + competence.competenceText + ' — Nº da guia: ' + extracted.guideNumber +
+        ' — Total pago: R$ ' + (extracted.guideTotalCents / 100).toFixed(2).replace('.', ',') + ' — Registros CSV: ' + csvAnalysis.records.length;
       diagnosticLogger.log('ISS_CORRETORA_CSV_READY', 'CSVs do ISS Corretora analisados e filtrados pela guia.', {
         period: competence.period,
         guideNumber: extracted.guideNumber,
@@ -2817,61 +3295,201 @@
         sources: csvAnalysis.sources
       });
 
-      item.textContent = 'ISS CORRETORA — conferência pronta';
-      setDebugStatus(detail);
-      await showIssCorretoraConference({
-        competenceText: competence.competenceText,
-        guideNumber: extracted.guideNumber,
-        pdfName: rawSource.pdfName || '',
-        csvAnalysis
-      }, runningController.signal);
-      if (runningController.signal.aborted) throw api.makeAbortError();
+      if (displayOptions.showGuideConference) {
+        item.textContent = 'ISS CORRETORA — conferência da guia pronta';
+        setDebugStatus(detail);
+        await showIssCorretoraConference({
+          competenceText: competence.competenceText,
+          guideNumber: extracted.guideNumber,
+          guideTotalCents: extracted.guideTotalCents,
+          pdfName: rawSource.pdfName || '',
+          csvAnalysis
+        }, runningController.signal);
+        if (runningController.signal.aborted) throw api.makeAbortError();
+      } else {
+        diagnosticLogger.log('ISS_CORRETORA_GUIDE_CONFERENCE_SKIPPED', 'Tabela de conferência da guia não exibida por opção do usuário.', {});
+      }
 
       let ownBackgroundProtection = false;
+      let protheusResult = null;
       try {
+        if (displayOptions.startAfterFilter) api.assertIssGridUnblocked(document);
         if (!backgroundProtectionActive) {
           await startBackgroundProtection();
           ownBackgroundProtection = true;
         }
 
-        const navigation = await api.runIssCorretoraAccountsPayableNavigation(document, {
-          signal: runningController.signal,
-          stepDelayMs: 200,
-          onTrustedClick: sendTrustedClick,
-          onStatus: (status) => {
-            item.textContent = status;
-            setDebugStatus(status);
-            diagnosticLogger.log('STATUS', status, runtimeState());
-          },
-          onLog: (category, message, data) => diagnosticLogger.log(category, message, data)
-        });
-        diagnosticLogger.log('ISS_CORRETORA_NAV_CLICKED', 'Clique de navegação em Funcoes Ctas a Pag concluído; a prontidão da tela será validada em seguida.', navigation);
-
         const currentMonthDayTen = api.formatIssDayTenOfCurrentMonth(new Date());
-        const dynamicFilter = await api.runIssCorretoraDynamicFilter(document, {
+        const filterRules = [
+          { field: 'Natureza', operator: 'Igual a', value: '20505' },
+          { field: 'Vencto Real', operator: 'Igual a', value: currentMonthDayTen, valueType: 'date' }
+        ];
+        if (displayOptions.startAfterFilter) {
+          if (!api.getIssCorretoraAccountsPayableReadiness(document).ready ||
+              !api.findIssFilterBanner(document) || !api.isIssGridFilteredByRules(document, filterRules)) {
+            throw new Error('ISS Corretora: abra Contas a Pagar e aplique antes o filtro Natureza 20505 e Vencto Real ' + currentMonthDayTen + '.');
+          }
+          diagnosticLogger.log('ISS_CORRETORA_PREAPPLIED_FILTER_READY', 'Filtro já aplicado: banner e linhas visíveis conferidos; Prefeitura já foi analisada.', {
+            rules: filterRules
+          });
+        } else {
+          const navigation = await api.runIssCorretoraAccountsPayableNavigation(document, {
+            signal: runningController.signal,
+            stepDelayMs: 200,
+            onTrustedClick: (target) => sendTrustedClick(target, { issGuard: true }),
+            onStatus: (status) => {
+              item.textContent = status;
+              setDebugStatus(status);
+              diagnosticLogger.log('STATUS', status, runtimeState());
+            },
+            onLog: (category, message, data) => diagnosticLogger.log(category, message, data)
+          });
+          diagnosticLogger.log('ISS_CORRETORA_NAV_CLICKED', 'Clique de navegação em Funcoes Ctas a Pag concluído; a prontidão da tela será validada em seguida.', navigation);
+
+          const dynamicFilter = await api.runIssCorretoraDynamicFilter(document, {
+            signal: runningController.signal,
+            filterName: 'AUTO ISS ' + competence.period + ' ' + String(Date.now()).slice(-6),
+            rules: filterRules,
+            onTrustedClick: (target) => sendTrustedClick(target, { issGuard: true }),
+            onTrustedText: sendTrustedText,
+            onTrustedKey: sendTrustedKey,
+            onManualDatePause: displayOptions.pauseAtDueDate
+              ? (data) => showIssCorretoraManualDatePause(data, runningController.signal)
+              : null,
+            onStatus: (status) => {
+              item.textContent = status;
+              setDebugStatus(status);
+              diagnosticLogger.log('STATUS', status, runtimeState());
+            },
+            onLog: (category, message, data) => diagnosticLogger.log(category, message, data)
+          });
+          diagnosticLogger.log('ISS_CORRETORA_DYNAMIC_FILTER_READY', 'Filtro do ISS Corretora foi criado do zero pelo código e aplicado.', dynamicFilter);
+        }
+
+        const collecting = 'ISS CORRETORA — coletando registros encontrados no Protheus...';
+        item.textContent = collecting;
+        setDebugStatus(collecting);
+        diagnosticLogger.log('STATUS', collecting, runtimeState());
+        const protheusRecords = await api.collectIssProtheusGridRecords(document, {
           signal: runningController.signal,
-          filterName: 'AUTO ISS ' + competence.period + ' ' + String(Date.now()).slice(-6),
-          rules: [
-            { field: 'Natureza', operator: 'Igual a', value: '20505' },
-            { field: 'Vencto Real', operator: 'Igual a', value: currentMonthDayTen, valueType: 'date' }
-          ],
-          onTrustedClick: sendTrustedClick,
-          onTrustedText: sendTrustedText,
-          onTrustedKey: sendTrustedKey,
-          onStatus: (status) => {
-            item.textContent = status;
-            setDebugStatus(status);
-            diagnosticLogger.log('STATUS', status, runtimeState());
-          },
-          onLog: (category, message, data) => diagnosticLogger.log(category, message, data)
+          onTrustedClick: (target) => sendTrustedClick(target, { issGuard: true })
         });
-        diagnosticLogger.log('ISS_CORRETORA_DYNAMIC_FILTER_READY', 'Filtro do ISS Corretora foi criado do zero pelo código e aplicado.', dynamicFilter);
+        if (displayOptions.startAfterFilter) api.assertIssPreappliedFilter(protheusRecords, filterRules);
+        const protheusSummary = api.buildIssProtheusRecordsSummary(protheusRecords);
+        const directReconciliation = api.reconcileIssMunicipalWithProtheus(csvAnalysis.records, protheusRecords);
+        const subsetStatus = 'ISS CORRETORA — calculando a melhor combinação dos títulos restantes...';
+        item.textContent = subsetStatus;
+        setDebugStatus(subsetStatus);
+        diagnosticLogger.log('STATUS', subsetStatus, runtimeState());
+        const reconciliation = await api.applyIssSubsetSelection(
+          directReconciliation,
+          extracted.guideTotalCents,
+          { signal: runningController.signal }
+        );
+        protheusResult = { records: reconciliation.records, summary: protheusSummary, reconciliation };
+        diagnosticLogger.log('ISS_CORRETORA_PROTHEUS_RECORDS_READY', 'Registros filtrados do Protheus foram coletados e resumidos.', {
+          recordCount: protheusSummary.recordCount,
+          totalTitleValueCents: protheusSummary.totalTitleValueCents,
+          issCount: protheusSummary.issCount,
+          txCount: protheusSummary.txCount,
+          actualDueDate: protheusSummary.actualDueDate,
+          nature: protheusSummary.nature
+        });
+        diagnosticLogger.log('ISS_CORRETORA_RECONCILIATION_READY', 'ISS da Prefeitura e títulos do Protheus comparados primeiro pelo valor exato e depois com tolerância máxima de um centavo.', {
+          matchRule: 'exact-first-then-one-cent-one-to-one',
+          matchedCount: reconciliation.summary.matchedCount,
+          matchedValueCents: reconciliation.summary.matchedValueCents,
+          exactMatchedCount: reconciliation.summary.exactMatchedCount,
+          oneCentMatchedCount: reconciliation.summary.oneCentMatchedCount,
+          notFoundCount: reconciliation.summary.notFoundCount,
+          notFoundValueCents: reconciliation.summary.notFoundValueCents,
+          notApplicableCount: reconciliation.summary.notApplicableCount,
+          unmatchedMunicipalCount: reconciliation.summary.unmatchedMunicipalCount,
+          unmatchedMunicipalValueCents: reconciliation.summary.unmatchedMunicipalValueCents
+        });
+        diagnosticLogger.log('ISS_CORRETORA_SUBSET_READY', 'Melhor combinação dos títulos restantes calculada sem ultrapassar o valor faltante da guia.', {
+          guideTotalCents: reconciliation.summary.guideTotalCents,
+          directSettlementValueCents: reconciliation.summary.directSettlementValueCents,
+          alreadyPaidUnmatchedValueCents: reconciliation.summary.alreadyPaidUnmatchedValueCents,
+          subsetTargetCents: reconciliation.summary.subsetTargetCents,
+          subsetCandidateCount: reconciliation.summary.subsetCandidateCount,
+          subsetSelectedCount: reconciliation.summary.subsetSelectedCount,
+          subsetSelectedValueCents: reconciliation.summary.subsetSelectedValueCents,
+          subsetResidualCents: reconciliation.summary.subsetResidualCents,
+          totalSettlementValueCents: reconciliation.summary.totalSettlementValueCents
+        });
         keepDebugOpenForRecorder = true;
-        setDebugStatus('Filtro Natureza = 20505 e Vencto Real = ' + currentMonthDayTen + ' criado pelo código, aplicado e validado. Gravador Geral continua disponível no Debug se precisar.');
+        setDebugStatus('Filtro aplicado: ' + reconciliation.summary.matchedCount + ' correspondência(s) direta(s) e ' + reconciliation.summary.subsetSelectedCount + ' título(s) por subconjunto para baixa.');
       } finally {
         if (ownBackgroundProtection) {
           try { await stopBackgroundProtection(); } catch (_) {}
         }
+      }
+
+      if (!protheusResult) throw new Error('ISS Corretora: a conferência dos registros do Protheus não foi concluída.');
+      if (displayOptions.showProtheusRecords) {
+        item.textContent = 'ISS CORRETORA — registros do Protheus prontos';
+        await showIssProtheusResults(protheusResult, runningController.signal);
+      } else {
+        diagnosticLogger.log('ISS_CORRETORA_PROTHEUS_RESULTS_SKIPPED', 'Tabela de registros do Protheus não exibida por opção do usuário.', {
+          recordCount: protheusResult.summary.recordCount,
+          totalTitleValueCents: protheusResult.summary.totalTitleValueCents
+        });
+      }
+      api.throwIfAborted(runningController.signal);
+
+      let batchResult = null;
+      if (displayOptions.settleAllRecords) {
+        const grid = api.findIssProtheusGrid(document);
+        const headers = grid && grid.shadowRoot && Array.from(grid.shadowRoot.querySelectorAll('thead th'));
+        if (!headers || !headers.some((th) => String(th.innerText || th.textContent || '').trim().toLowerCase() === 'dt baixa'))
+          throw new Error('ISS Corretora: coluna DT Baixa não disponível para identificar títulos já baixados; lote bloqueado.');
+        const plan = api.planIssSettlementBatch(protheusResult.records);
+        diagnosticLogger.log('ISS_SETTLEMENT_BATCH_PLAN', 'Títulos SIM planejados; os já baixados foram separados antes de Salvar.', {
+          pendingCount: plan.pending.length, alreadyPaidCount: plan.alreadyPaid.length, totalCents: plan.totalCents
+        });
+        item.textContent = 'ISS CORRETORA — conferindo e baixando títulos pendentes...';
+        await startBackgroundProtection();
+        try {
+          batchResult = await api.runIssSettlementBatch(protheusResult.records, {
+            signal: runningController.signal,
+            confirm: (selection) => window.confirm(
+              'CONFIRMAR BAIXA EM SEQUÊNCIA NO PROTHEUS?\n\n' +
+              'Pendentes: ' + selection.pending.length + ' título(s) SIM\n' +
+              'Já baixados (serão pulados): ' + selection.alreadyPaid.length + '\n' +
+              'Total pendente: R$ ' + (selection.totalCents / 100).toFixed(2).replace('.', ',') + '\n' +
+              'Banco: 033 | Motivo: DÉBITO CC\n\n' +
+              'Cada título será conferido e salvo uma vez. A rotina parará se alguma baixa não for confirmada.'
+            ),
+            onProgress: (record, done, total) => {
+              const status = 'ISS CORRETORA — baixando título ' + (done + 1) + '/' + total + ': ' + record.title + '...';
+              item.textContent = status;
+              setDebugStatus(status);
+              diagnosticLogger.log('ISS_SETTLEMENT_ITEM_START', status, { identity: record.identity, done, total });
+            },
+            settle: async (record) => {
+              const settled = await api.settleIssRecordInProtheus(document, record, {
+                signal: runningController.signal,
+                onTrustedClick: (target) => sendTrustedClick(target, { issGuard: true }),
+                onTrustedHover: sendTrustedHover,
+                onTrustedText: sendTrustedText,
+                onTrustedKey: sendTrustedKey,
+                onLog: (category, message, data) => diagnosticLogger.log(category, message, data),
+                onStatus: (message) => setDebugStatus(message),
+                onApprove: () => true
+              });
+              if (settled) diagnosticLogger.log('ISS_SETTLEMENT_ITEM_CONFIRMED', 'Baixa confirmada pela data do título na grade.', {
+                identity: record.identity
+              });
+              return settled;
+            }
+          });
+        } finally {
+          await stopBackgroundProtection();
+        }
+        diagnosticLogger.log('ISS_SETTLEMENT_BATCH_RESULT', batchResult.cancelled ? 'Lote cancelado antes de Salvar.' : 'Baixas do lote confirmadas na grade.', {
+          settledCount: batchResult.settled.length, alreadyPaidCount: batchResult.alreadyPaid.length, cancelled: batchResult.cancelled
+        });
       }
 
       await diagnosticLogger.stopRun('concluída', {
@@ -2880,7 +3498,27 @@
         guideNumber: extracted.guideNumber,
         extractionMethod: extracted.method || '',
         recordCount: csvAnalysis.records.length,
-        totalIssDueCents: csvAnalysis.totalIssDueCents
+        totalIssDueCents: csvAnalysis.totalIssDueCents,
+        guideTotalCents: extracted.guideTotalCents,
+        protheusRecordCount: protheusResult.summary.recordCount,
+        protheusTotalTitleValueCents: protheusResult.summary.totalTitleValueCents,
+        protheusIssCount: protheusResult.summary.issCount,
+        protheusTxCount: protheusResult.summary.txCount,
+        protheusMatchedIssCount: protheusResult.reconciliation.summary.matchedCount,
+        protheusMatchedIssValueCents: protheusResult.reconciliation.summary.matchedValueCents,
+        protheusExactMatchedIssCount: protheusResult.reconciliation.summary.exactMatchedCount,
+        protheusOneCentMatchedIssCount: protheusResult.reconciliation.summary.oneCentMatchedCount,
+        protheusSubsetTargetCents: protheusResult.reconciliation.summary.subsetTargetCents,
+        protheusAlreadyPaidUnmatchedValueCents: protheusResult.reconciliation.summary.alreadyPaidUnmatchedValueCents,
+        protheusSubsetSelectedCount: protheusResult.reconciliation.summary.subsetSelectedCount,
+        protheusSubsetSelectedValueCents: protheusResult.reconciliation.summary.subsetSelectedValueCents,
+        protheusSubsetResidualCents: protheusResult.reconciliation.summary.subsetResidualCents,
+        protheusTotalSettlementValueCents: protheusResult.reconciliation.summary.totalSettlementValueCents,
+        protheusUnmatchedIssCount: protheusResult.reconciliation.summary.notFoundCount,
+        municipalUnmatchedCount: protheusResult.reconciliation.summary.unmatchedMunicipalCount,
+        settlementConfirmedCount: batchResult ? batchResult.settled.length : 0,
+        settlementAlreadyPaidCount: batchResult ? batchResult.alreadyPaid.length : 0,
+        settlementBatchCancelled: !!(batchResult && batchResult.cancelled)
       });
       item.textContent = original;
       item.disabled = false;
@@ -2909,7 +3547,7 @@
         item.textContent = message;
         item.style.color = '#a12622';
         setDebugStatus('ERRO: ' + message);
-        diagnosticLogger.log('ERROR', 'Falha na primeira etapa da rotina ISS Corretora.', {
+        diagnosticLogger.log('ERROR', 'Falha na rotina ISS Corretora.', {
           message,
           stack: error && error.stack ? String(error.stack).slice(0, 4000) : ''
         });
@@ -2985,7 +3623,9 @@
         return;
       }
       if (routine.id === 'iss-corretora') {
-        await runIssCorretoraRoutine(item, routine);
+        const runOptions = await showIssCorretoraRunOptions();
+        if (!runOptions) return;
+        await runIssCorretoraRoutine(item, routine, runOptions);
         return;
       }
       if (routine.id !== 'emissao-comissoes') return;
@@ -3038,6 +3678,7 @@
           skipPayments,
           onExcelSync: sendExcelSync,
           onTrustedClick: sendTrustedClick,
+          onTrustedKey: sendTrustedKey,
           ensureBackgroundProtection,
           onStatus: (message) => {
             item.textContent = message;

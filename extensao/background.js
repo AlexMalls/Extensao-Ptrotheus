@@ -1,6 +1,6 @@
 const PROTHEUS_URLS = Object.freeze(['https://erp.positiva.com.br/*', 'https://erp-corretora.positiva.com.br/*']);
 const DEBUGGER_VERSION = '1.3';
-const CONTENT_VERSION = '5.7.8';
+const CONTENT_VERSION = '5.15.7';
 const REASSERT_INTERVAL_MS = 10000;
 const protectionSessions = new Map();
 const recorderSessions = new Map();
@@ -248,16 +248,116 @@ async function sendCdp(tabId, method, params) {
   return chrome.debugger.sendCommand(getTarget(tabId), method, params || {});
 }
 
-async function dispatchTrustedClick(tabId, x, y) {
+// Executado no renderer imediatamente antes do input, após os awaits de CDP.
+// O token identifica a instância DOM, não um ID COMP que pode ser reutilizado.
+function inspectTrustedTargetInPage(expected, mode, skipValue) {
+  if (!expected || !/^[a-zA-Z0-9-]+$/.test(expected.token || '')) return { ok: false, reason: 'invalid-target-token' };
+  const matches = [];
+  const visited = new Set();
+  function visit(root) {
+    if (!root || visited.has(root)) return;
+    visited.add(root);
+    for (const node of root.querySelectorAll('[data-pos-protheus-target="' + expected.token + '"]')) matches.push(node);
+    for (const node of root.querySelectorAll('*')) if (node.shadowRoot) visit(node.shadowRoot);
+  }
+  visit(document);
+  if (matches.length !== 1) return { ok: false, reason: 'target-missing-or-ambiguous' };
+  const target = matches[0];
+  if (!target.isConnected || target.disabled || target.readOnly) return { ok: false, reason: 'target-unavailable' };
+  const parent = (node) => node.parentElement || (node.getRootNode && node.getRootNode().host);
+  let node = target;
+  let dialogMarkedBlocked = false;
+  for (let depth = 0; node && depth < 60; depth++, node = parent(node)) {
+    if (node.hasAttribute && (node.hasAttribute('hidden') || node.hasAttribute('inert'))) return { ok: false, reason: 'target-hidden' };
+    if (String(node.tagName).toUpperCase() === 'WA-DIALOG') {
+      // O Protheus conserva "blocked" em diálogos ainda utilizáveis.
+      // Não confundir esse atributo com uma sobreposição real de tela.
+      dialogMarkedBlocked = node.hasAttribute('blocked');
+      break;
+    }
+  }
+  function isActuallyExposed(anchor, expectedHitTarget) {
+    if (!anchor || typeof anchor.getBoundingClientRect !== 'function') return null;
+    const rect = anchor.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    if (x < 0 || y < 0 || x >= document.documentElement.clientWidth || y >= document.documentElement.clientHeight) return null;
+    let hit = document.elementFromPoint(x, y);
+    while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+      const child = hit.shadowRoot.elementFromPoint(x, y);
+      if (!child || child === hit) break;
+      hit = child;
+    }
+    const accepted = expectedHitTarget || anchor;
+    while (hit && hit !== accepted) hit = parent(hit);
+    return hit === accepted ? { x, y } : null;
+  }
+  const host = target.getRootNode().host;
+  if (!host || host.getAttribute('id') !== expected.hostId ||
+      (host.getAttribute('type') || '') !== expected.hostType ||
+      (host.getAttribute('picture') || '') !== expected.hostPicture ||
+      (host.getAttribute('name') || '') !== expected.hostName) return { ok: false, reason: 'control-changed' };
+  if (mode === 'click') {
+    if (expected.ensureVisible) {
+      try { if (typeof host.scrollIntoView === 'function') host.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+      try { if (typeof target.scrollIntoView === 'function') target.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+    }
+    let anchor = target;
+    if (String(host.tagName || '').toUpperCase() === 'WA-CHECKBOX') {
+      anchor = host.shadowRoot && host.shadowRoot.querySelector('input[type="checkbox"]');
+      if (!anchor || !anchor.isConnected || anchor.disabled) return { ok: false, reason: 'checkbox-input-unavailable' };
+      if (expected.ensureChecked && anchor.checked === true) return { ok: true, alreadyChecked: true };
+    }
+    // Proteção física: só envia o clique se o ponto realmente atingir o
+    // controle esperado, inclusive quando houver wa-dialog[blocked] antigo.
+    const point = isActuallyExposed(anchor, target);
+    if (!point) return { ok: false, reason: 'target-occluded' };
+    // Em checkboxes o alvo real é o input; nos outros controles é o próprio target.
+    // A função de hit-test percorre os elementos internos do Shadow DOM.
+    return { ok: true, x: point.x, y: point.y };
+  }
+  let active = document.activeElement;
+  while (active && active.shadowRoot && active.shadowRoot.activeElement) active = active.shadowRoot.activeElement;
+  if (active !== target) return { ok: false, reason: 'focus-mismatch' };
+  // Quando o atributo blocked estiver desatualizado, só liberar a digitação
+  // se o input focado também estiver realmente exposto na tela.
+  if (dialogMarkedBlocked && !isActuallyExposed(target)) return { ok: false, reason: 'target-occluded' };
+  if (!skipValue && (String(target.value) !== expected.value ||
+      target.selectionStart !== expected.selectionStart || target.selectionEnd !== expected.selectionEnd)) {
+    return { ok: false, reason: 'value-or-caret-changed' };
+  }
+  return { ok: true };
+}
+
+async function verifyTrustedTarget(tabId, expected, mode, skipValue) {
+  if (!expected) return { ok: true };
+  const response = await sendCdp(tabId, 'Runtime.evaluate', {
+    expression: '(' + inspectTrustedTargetInPage.toString() + ')(' + JSON.stringify(expected) + ',' + JSON.stringify(mode) + ',' + !!skipValue + ')',
+    returnByValue: true
+  });
+  const result = response && response.result && response.result.value;
+  if (!result || result.ok !== true) throw new Error('ISS_INPUT_GUARD: ' + (result && result.reason || 'target-check-failed'));
+  return result;
+}
+
+async function dispatchTrustedClick(tabId, x, y, expectedTarget) {
   if (!Number.isInteger(tabId)) throw new Error('A aba do Protheus não pôde ser identificada.');
-  const clientX = Number(x);
-  const clientY = Number(y);
+  let clientX = Number(x);
+  let clientY = Number(y);
   if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) {
     throw new Error('Coordenadas inválidas para o clique confiável.');
   }
 
   if (!protectionSessions.has(tabId)) await startProtection(tabId);
   else await reassertProtection(tabId);
+
+  if (expectedTarget) {
+    const point = await verifyTrustedTarget(tabId, expectedTarget, 'click');
+    if (point.alreadyChecked) return { ok: true, trusted: true, alreadyChecked: true, clickDispatched: false };
+    clientX = point.x;
+    clientY = point.y;
+  }
 
   await sendCdp(tabId, 'Input.dispatchMouseEvent', {
     type: 'mouseMoved',
@@ -267,6 +367,11 @@ async function dispatchTrustedClick(tabId, x, y) {
     buttons: 0
   });
   const rendererSettled = await yieldRendererInputTurn(tabId);
+  if (expectedTarget) {
+    const point = await verifyTrustedTarget(tabId, expectedTarget, 'click');
+    if (point.alreadyChecked) return { ok: true, trusted: true, alreadyChecked: true, clickDispatched: false };
+    if (Math.abs(point.x - clientX) > 1 || Math.abs(point.y - clientY) > 1) throw new Error('ISS_INPUT_GUARD: target-moved');
+  }
   await sendCdp(tabId, 'Input.dispatchMouseEvent', {
     type: 'mousePressed',
     x: clientX,
@@ -284,6 +389,26 @@ async function dispatchTrustedClick(tabId, x, y) {
     clickCount: 1
   });
 
+  return { ok: true, trusted: true, rendererSettled, x: clientX, y: clientY };
+}
+
+async function dispatchTrustedHover(tabId, x, y, expectedTarget) {
+  if (!Number.isInteger(tabId)) throw new Error('A aba do Protheus não pôde ser identificada.');
+  let clientX = Number(x);
+  let clientY = Number(y);
+  if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) throw new Error('Coordenadas inválidas para o hover confiável.');
+  if (!protectionSessions.has(tabId)) await startProtection(tabId);
+  else await reassertProtection(tabId);
+  if (expectedTarget) {
+    const point = await verifyTrustedTarget(tabId, expectedTarget, 'click');
+    clientX = point.x;
+    clientY = point.y;
+  }
+  await sendCdp(tabId, 'Input.dispatchMouseEvent', {
+    type: 'mouseMoved', x: clientX, y: clientY, button: 'none', buttons: 0
+  });
+  const rendererSettled = await yieldRendererInputTurn(tabId);
+  if (expectedTarget) await verifyTrustedTarget(tabId, expectedTarget, 'click');
   return { ok: true, trusted: true, rendererSettled, x: clientX, y: clientY };
 }
 
@@ -332,7 +457,7 @@ async function yieldRendererInputTurn(tabId) {
   }
 }
 
-async function dispatchTrustedKey(tabId, key) {
+async function dispatchTrustedKey(tabId, key, expectedTarget) {
   if (!Number.isInteger(tabId)) throw new Error('A aba do Protheus não pôde ser identificada.');
   const normalized = String(key || '').trim();
   let keyInfo = normalized === 'F2'
@@ -363,21 +488,28 @@ async function dispatchTrustedKey(tabId, key) {
   if (!protectionSessions.has(tabId)) await startProtection(tabId);
   else await reassertProtection(tabId);
 
+  await verifyTrustedTarget(tabId, expectedTarget, 'key');
   await sendCdp(tabId, 'Input.dispatchKeyEvent', Object.assign({ type: 'keyDown' }, keyInfo));
-  if (printable) {
-    await sendCdp(tabId, 'Input.dispatchKeyEvent', Object.assign({ type: 'char', text: normalized, unmodifiedText: normalized }, keyInfo));
+  try {
+    if (printable) {
+      // keyDown pode trocar o foco antes do evento char. Não escreva no novo alvo.
+      await verifyTrustedTarget(tabId, expectedTarget, 'key', true);
+      await sendCdp(tabId, 'Input.dispatchKeyEvent', Object.assign({ type: 'char', text: normalized, unmodifiedText: normalized }, keyInfo));
+    }
+  } finally {
+    await sendCdp(tabId, 'Input.dispatchKeyEvent', Object.assign({ type: 'keyUp' }, keyInfo));
   }
-  await sendCdp(tabId, 'Input.dispatchKeyEvent', Object.assign({ type: 'keyUp' }, keyInfo));
   return { ok: true, trusted: true, key: normalized };
 }
 
-async function dispatchTrustedText(tabId, text) {
+async function dispatchTrustedText(tabId, text, expectedTarget) {
   if (!Number.isInteger(tabId)) throw new Error('A aba do Protheus não pôde ser identificada.');
   const value = String(text == null ? '' : text);
 
   if (!protectionSessions.has(tabId)) await startProtection(tabId);
   else await reassertProtection(tabId);
 
+  await verifyTrustedTarget(tabId, expectedTarget, 'text');
   await sendCdp(tabId, 'Input.insertText', { text: value });
   return { ok: true, trusted: true, textLength: value.length };
 }
@@ -513,11 +645,19 @@ function getProtectionStatus(tabId) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message && message.type === 'pos-protheus-trusted-hover') {
+    const tabId = sender && sender.tab && sender.tab.id;
+    (async () => {
+      try { return await dispatchTrustedHover(tabId, message.x, message.y, message.expectedTarget); }
+      catch (error) { return { ok: false, trusted: false, error: normalizeError(error) }; }
+    })().then(sendResponse, (error) => sendResponse({ ok: false, trusted: false, error: normalizeError(error) }));
+    return true;
+  }
   if (message && message.type === 'pos-protheus-trusted-click') {
     const tabId = sender && sender.tab && sender.tab.id;
     (async () => {
       try {
-        return await dispatchTrustedClick(tabId, message.x, message.y);
+        return await dispatchTrustedClick(tabId, message.x, message.y, message.expectedTarget);
       } catch (error) {
         return { ok: false, trusted: false, error: normalizeError(error) };
       }
@@ -541,7 +681,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const tabId = sender && sender.tab && sender.tab.id;
     (async () => {
       try {
-        return await dispatchTrustedKey(tabId, message.key);
+        return await dispatchTrustedKey(tabId, message.key, message.expectedTarget);
       } catch (error) {
         return { ok: false, trusted: false, error: normalizeError(error) };
       }
@@ -553,7 +693,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const tabId = sender && sender.tab && sender.tab.id;
     (async () => {
       try {
-        return await dispatchTrustedText(tabId, message.text);
+        return await dispatchTrustedText(tabId, message.text, message.expectedTarget);
       } catch (error) {
         return { ok: false, trusted: false, error: normalizeError(error) };
       }

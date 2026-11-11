@@ -368,8 +368,8 @@
 
   function getIssCorretoraCompetenceFromFileName(fileName) {
     const name = String(fileName == null ? '' : fileName).trim();
-    const match = /^CORRETORA_GUIA_ISS_DAMSP_58345965_(\d{6})\.PDF$/i.exec(name);
-    if (!match) throw new Error('ISS Corretora: nome do PDF fora do padrão esperado.');
+    const match = /^CORRETORA_(?:GUIA_)?ISS_DAMSP_58345965_(\d{6})\.PDF$/i.exec(name);
+    if (!match) throw new Error('ISS Corretora: nome do PDF fora do padrão esperado para a guia DAMSP.');
     const period = match[1];
     const year = Number(period.slice(0, 4));
     const month = Number(period.slice(4, 6));
@@ -382,6 +382,16 @@
       month,
       competenceText: String(month).padStart(2, '0') + '/' + String(year)
     };
+  }
+
+  function getIssCorretoraCsvFilePeriod(fileName) {
+    const name = String(fileName == null ? '' : fileName).trim();
+    const match = /^NFSe(?:_E)?_58345965_(\d{8})_(\d{8})\.csv$/i.exec(name);
+    if (!match) throw new Error('ISS Corretora: nome de CSV fora do padrão esperado: ' + name + '.');
+    const startPeriod = match[1].slice(0, 6);
+    const endPeriod = match[2].slice(0, 6);
+    if (startPeriod !== endPeriod) throw new Error('ISS Corretora: intervalo do CSV cruza competências: ' + name + '.');
+    return startPeriod;
   }
 
   function getIssCorretoraCsvFileNames(periodValue) {
@@ -408,7 +418,8 @@
     const fields = [
       { key: 'competence', label: 'Competência', value: String(data.competenceText || '') },
       { key: 'guideNumber', label: 'Nº da guia', value: String(data.guideNumber || '') },
-      { key: 'pdfName', label: 'Arquivo', value: String(data.pdfName || '') }
+      { key: 'pdfName', label: 'Arquivo', value: String(data.pdfName || '') },
+      { key: 'guideTotal', label: 'Total da guia', value: 'R$ ' + formatCentsBR(data.guideTotalCents) }
     ];
 
     const analysis = data.csvAnalysis;
@@ -582,6 +593,30 @@
       throw new Error('ISS Corretora: não foi possível derivar o número da guia do código de barras DAMSP.');
     }
     return guideNumber;
+  }
+
+  function extractIssGuideTotalCentsFromDamspBarcode(value) {
+    const digits = String(value == null ? '' : value).replace(/\D/g, '');
+    if (!/^8\d{43}$/.test(digits)) throw new Error('ISS Corretora: código de barras DAMSP inválido.');
+    // No DAMSP com indicador de valor 8, as posições 5 a 15 são o valor em centavos.
+    if (digits[2] !== '8') throw new Error('ISS Corretora: código DAMSP sem indicador monetário em reais.');
+    const cents = Number(digits.slice(4, 15));
+    if (!Number.isSafeInteger(cents) || cents <= 0)
+      throw new Error('ISS Corretora: valor total da guia ausente ou inválido no código de barras.');
+    return cents;
+  }
+
+  function extractIssGuideTotalCentsFromText(rawText) {
+    const text = String(rawText == null ? '' : rawText).replace(/\u00a0/g, ' ');
+    const totals = Array.from(text.matchAll(/\bTotal\s*\(R\$\)\s*([\d.]+,\d{2})/gi), (match) => {
+      const value = match[1].replace(/\./g, '').replace(',', '');
+      return Number(value);
+    });
+    if (!totals.length || !totals.every((total) => Number.isSafeInteger(total) && total > 0))
+      throw new Error('ISS Corretora: campo Total da guia não identificado no texto do PDF.');
+    if (totals.some((total) => total !== totals[0]))
+      throw new Error('ISS Corretora: os valores Total das vias da guia divergem.');
+    return totals[0];
   }
 
   function decodePdfBase64Bytes(base64) {
@@ -804,15 +839,19 @@
     const pdfBytes = decodePdfBase64Bytes(base64);
     const pdfText = bytesToLatin1(pdfBytes);
 
-    // Se uma futura versão da Prefeitura voltar a trazer camada textual, usa a regra original aprovada.
+    // Guias futuras podem voltar a oferecer uma camada textual; o total
+    // precisa ser lido do próprio PDF também nesse caso.
+    let textualGuide = null;
     try {
       const text = extractJorgePdfText(base64);
       const parsed = extractIssGuideNumberFromText(text);
-      if (parsed && parsed.guideNumber) {
-        return Object.assign({ method: 'pdf-text', barcodeDigits: '' }, parsed);
-      }
+      if (parsed && parsed.guideNumber) textualGuide = { text, parsed };
     } catch (_) {
       // A guia DAMSP atual é rasterizada; segue para leitura determinística do código I25.
+    }
+    if (textualGuide) {
+      const guideTotalCents = extractIssGuideTotalCentsFromText(textualGuide.text);
+      return Object.assign({ method: 'pdf-text', barcodeDigits: '', guideTotalCents }, textualGuide.parsed);
     }
 
     const image = findIssPdfIndexedImage(pdfBytes, pdfText);
@@ -825,7 +864,8 @@
     const darkMap = buildPaletteDarkMap(paletteInfo.bytes, image.maxPaletteIndex);
     const barcodeDigits = decodeDamspI25FromIndexedImage(indexedPixels, image.width, image.height, darkMap);
     const guideNumber = extractIssGuideNumberFromDamspBarcode(barcodeDigits);
-    return { guideNumber, barcodeDigits, method: 'damsp-i25-barcode' };
+    const guideTotalCents = extractIssGuideTotalCentsFromDamspBarcode(barcodeDigits);
+    return { guideNumber, guideTotalCents, barcodeDigits, method: 'damsp-i25-barcode' };
   }
 
   function buildJorgeReimbursementPreview(sourceData, date) {
@@ -1275,9 +1315,10 @@
       for (const node of nodes) {
         if (!node || seen.has(node)) continue;
         seen.add(node);
-        if (!isElementActive(node) || isControlLocked(node)) continue;
         try {
-          if (!predicate || predicate(node)) matches.push(node);
+          // Filtre a identidade antes de consultar layout de cada célula da grade.
+          if (predicate && !predicate(node)) continue;
+          if (isElementActive(node) && !isControlLocked(node)) matches.push(node);
         } catch (_) {}
       }
     }
@@ -1525,7 +1566,7 @@
     const seen = new Set();
     for (const root of roots) {
       let nodes = [];
-      try { nodes = Array.from(root.querySelectorAll('*')); } catch (_) {}
+      try { nodes = Array.from(root.querySelectorAll('wa-button')); } catch (_) {}
       for (const node of nodes) {
         if (!node || seen.has(node) || !isElementActive(node) || isControlLocked(node)) continue;
         seen.add(node);
@@ -1554,6 +1595,22 @@
   function findIssFilterConditionButton(doc, caption) {
     const dialog = findIssFilterCreateDialog(doc || document);
     return dialog ? findUniqueIssButtonByCaption(doc || document, caption, 'tbutton', dialog) : null;
+  }
+
+  function isIssFilterTokenSequenceValid(panel, conditionCaptions) {
+    if (!panel || !conditionCaptions.length) return false;
+    const expected = conditionCaptions.flatMap((caption, index) => index ? ['e', caption] : [caption]);
+    const actual = Array.from(panel.querySelectorAll('wa-button[data-advpl="tbutton"]'))
+      .filter(isElementActive).map((node) => node.getAttribute('caption') || '');
+    return actual.length === expected.length && actual.every((caption, index) =>
+      normalizeIssNavigationLabel(caption, false) === normalizeIssNavigationLabel(expected[index], false));
+  }
+
+  function isIssFilterExpressionComplete(doc, conditionCaptions) {
+    const first = findIssFilterConditionButton(doc, conditionCaptions[0]);
+    // Na gravação, os tokens são filhos do tscrollbox da expressão (não da toolbar).
+    const panel = first && first.closest('wa-panel[data-advpl="tscrollbox"]');
+    return isIssFilterTokenSequenceValid(panel, conditionCaptions);
   }
 
   function findIssFilterLogicalConnectorButton(doc, caption) {
@@ -1640,50 +1697,29 @@
     return info.executed === true && info.observedChecked === true;
   }
 
+  function getIssTrustedClickAnchor(control) {
+    if (control && String(control.tagName || '').toUpperCase() === 'WA-CHECKBOX') {
+      const input = control.shadowRoot && control.shadowRoot.querySelector('input[type="checkbox"]');
+      return input && input.isConnected && !isControlLocked(input) ? input : null;
+    }
+    return getNativeActionTarget(control);
+  }
+
   async function activateIssSavedFilterCheckbox(control, options) {
     const opts = options || {};
-    const strategy = String(opts.strategy || 'native').toLowerCase();
     const onTrustedClick = typeof opts.onTrustedClick === 'function' ? opts.onTrustedClick : null;
     const onLog = typeof opts.onLog === 'function' ? opts.onLog : function () {};
     if (!control || isControlLocked(control)) return false;
     if (isIssCheckboxChecked(control)) return true;
 
-    const native = getNativeActionTarget(control);
-    if (!native || isControlLocked(native)) return false;
-    try {
-      if (typeof native.focus === 'function') {
-        try { native.focus({ preventScroll: true }); } catch (_) { try { native.focus(); } catch (_) {} }
-      }
-    } catch (_) {}
-
-    if (strategy === 'native') {
-      let executed = false;
-      try {
-        if (typeof native.click === 'function') {
-          native.click();
-          executed = true;
-        }
-      } catch (_) { executed = false; }
-      emitDiagnostic(onLog, 'ISS_CORRETORA_FILTER_SELECTION_NATIVE', 'Clique nativo no input do checkbox enviado; o estado marcado será validado antes de qualquer Apply.', {
-        executed,
-        checked: isIssCheckboxChecked(control),
-        target: describeActionTarget(control)
-      });
-      return executed;
-    }
-
-    if (strategy === 'trusted') {
-      if (!onTrustedClick) return false;
-      const executed = !!(await Promise.resolve(onTrustedClick(control)));
-      emitDiagnostic(onLog, 'ISS_CORRETORA_FILTER_SELECTION_TRUSTED', 'Fallback de clique confiável no checkbox enviado após confirmação de que ele continuava desmarcado.', {
-        executed,
-        checked: isIssCheckboxChecked(control),
-        target: describeActionTarget(control)
-      });
-      return executed;
-    }
-
-    return false;
+    if (!onTrustedClick) return false;
+    const executed = !!(await Promise.resolve(onTrustedClick(control)));
+    emitDiagnostic(onLog, 'ISS_CORRETORA_FILTER_SELECTION_TRUSTED', 'Clique confiável direcionado ao quadradinho do checkbox; aguardando confirmação de seleção.', {
+      executed,
+      checked: isIssCheckboxChecked(control),
+      target: describeActionTarget(control)
+    });
+    return executed;
   }
 
   function findIssFilterBanner(doc) {
@@ -1701,9 +1737,118 @@
     try { return normalizeIssFilterTextValue(inner.value); } catch (_) { return ''; }
   }
 
+  function isIssControlReady(control) {
+    if (!control || control.isConnected !== true || isControlLocked(control)) return false;
+    // Um diálogo externo pode estar bloqueado pela própria janela modal filha.
+    // A trava relevante é a do diálogo que possui este controle.
+    let node = control;
+    for (let depth = 0; node && depth < 60; depth++) {
+      if (node.hasAttribute && (node.hasAttribute('inert') || node.hasAttribute('hidden'))) return false;
+      if (String(node.tagName || '').toUpperCase() === 'WA-DIALOG') {
+        if (!node.hasAttribute('blocked')) return true;
+        // Alguns diálogos permanecem com blocked após o retorno à grade.
+        // Aceitar somente quando o controle REAL estiver exposto ao clique:
+        // modal ativo, sombra ou sobreposição fazem o hit-test falhar.
+        const anchor = getNativeActionTarget(control);
+        const doc = control.ownerDocument;
+        if (!anchor || !doc || typeof doc.elementFromPoint !== 'function') return false;
+        const rect = anchor.getBoundingClientRect && anchor.getBoundingClientRect();
+        if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+        const x = rect.left + rect.width / 2;
+        const y = rect.top + rect.height / 2;
+        if (x < 0 || y < 0 || x >= doc.documentElement.clientWidth || y >= doc.documentElement.clientHeight) return false;
+        let hit = doc.elementFromPoint(x, y);
+        while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+          const inner = hit.shadowRoot.elementFromPoint(x, y);
+          if (!inner || inner === hit) break;
+          hit = inner;
+        }
+        for (let depth = 0; hit && depth < 60; depth++) {
+          if (hit === anchor) return true;
+          hit = hit.parentElement || (hit.getRootNode && hit.getRootNode().host);
+        }
+        return false;
+      }
+      node = node.parentElement || (node.getRootNode && node.getRootNode().host);
+    }
+    return true;
+  }
+
+  function hasIssInputFocus(control) {
+    const inner = getInnerEditable(control);
+    if (!isIssControlReady(control) || !inner || inner.isConnected !== true || isControlLocked(inner)) return false;
+    let active = control.ownerDocument && control.ownerDocument.activeElement;
+    while (active && active.shadowRoot && active.shadowRoot.activeElement) active = active.shadowRoot.activeElement;
+    return active === inner;
+  }
+
+  function issInputSignature(control) {
+    return JSON.stringify(['id', 'name', 'type', 'picture', 'maxlength'].map((name) => control.getAttribute(name)));
+  }
+
+  function armIssClickValidation(control, validate) {
+    const doc = control.ownerDocument;
+    let failure = null;
+    const capture = (event) => {
+      if (!event.composedPath().includes(control)) return;
+      try { validate(); } catch (error) {
+        failure = error;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    };
+    doc.addEventListener('click', capture, true);
+    return { error: () => failure, release: () => doc.removeEventListener('click', capture, true) };
+  }
+
+  function armIssInputEventGuard(control) {
+    const input = getInnerEditable(control);
+    const doc = control && control.ownerDocument;
+    if (!input || !doc) throw new Error('ISS: input não identificado para proteção de eventos.');
+    let blocked = false;
+    const signature = issInputSignature(control);
+    const types = ['keydown', 'keypress', 'beforeinput'];
+    const capture = (event) => {
+      const target = event.composedPath()[0];
+      if (target === input && input.isConnected && isIssControlReady(control) && issInputSignature(control) === signature) return;
+      blocked = true;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+    for (const type of types) doc.addEventListener(type, capture, true);
+    return {
+      blocked: () => blocked,
+      release: () => { for (const type of types) doc.removeEventListener(type, capture, true); }
+    };
+  }
+
+  async function waitForIssInputReady(control, options, dateOnly) {
+    const opts = options || {};
+    const resolve = typeof opts.resolveControl === 'function' ? opts.resolveControl : () => control;
+    let candidate = null;
+    let previousInput = null;
+    let stableSince = 0;
+    const ready = await waitForCondition(() => {
+      candidate = resolve();
+      const inner = getInnerEditable(candidate);
+      const typed = !dateOnly || (candidate && candidate.getAttribute('type') === 'date' &&
+        String(candidate.getAttribute('picture') || '').includes('99/99/9999') &&
+        candidate.getAttribute('maxlength') === '10' &&
+        (dateOnly !== 'mask' || /^\s*[\d ]{0,2}\s*\/\s*[\d ]{0,2}\s*\/\s*[\d ]{0,4}\s*$/.test(String(inner && inner.value || ''))));
+      if (!isIssControlReady(candidate) || !inner || inner.isConnected !== true || isControlLocked(inner) || !typed) {
+        previousInput = null;
+        stableSince = 0;
+        return false;
+      }
+      if (inner !== previousInput) { previousInput = inner; stableSince = Date.now(); }
+      return Date.now() - stableSince >= 180;
+    }, 5000, 60, opts.signal);
+    return ready ? candidate : null;
+  }
+
   function focusIssFilterTextControl(control, options) {
     const inner = getInnerEditable(control);
-    if (!inner || isControlLocked(inner)) return false;
+    if (!isIssControlReady(control) || !inner || inner.isConnected !== true || isControlLocked(inner)) return false;
     const opts = options || {};
     const selectAll = opts.selectAll !== false;
     try {
@@ -1713,7 +1858,7 @@
       if (selectAll && typeof inner.select === 'function') {
         try { inner.select(); } catch (_) {}
       }
-      return true;
+      return hasIssInputFocus(control);
     } catch (_) {
       return false;
     }
@@ -1727,6 +1872,8 @@
     const onTrustedClick = typeof opts.onTrustedClick === 'function' ? opts.onTrustedClick : null;
     const onTrustedText = typeof opts.onTrustedText === 'function' ? opts.onTrustedText : null;
     const onLog = typeof opts.onLog === 'function' ? opts.onLog : null;
+    control = await waitForIssInputReady(control, opts, false);
+    if (!control) return false;
     const current = readIssFilterTextControl(control);
     if (current === target) return true;
     if (!onTrustedText) return false;
@@ -1737,26 +1884,47 @@
       targetValue: target
     });
 
-    const focusedBefore = focusIssFilterTextControl(control);
     if (onTrustedClick) {
       const clicked = await Promise.resolve(onTrustedClick(control));
-      if (!clicked && !focusedBefore) return false;
-      await abortableSleep(60, signal);
+      if (!clicked) return false;
     }
-    if (!focusIssFilterTextControl(control) && !focusedBefore) return false;
+    control = await waitForIssInputReady(control, opts, false);
+    if (!control || !focusIssFilterTextControl(control)) return false;
     emitDiagnostic(onLog, 'ISS_CORRETORA_TEXT_WRITE', 'Enviando texto confiável para o input interno selecionado.', {
       target: describeActionTarget(control),
       targetValue: target,
       writeValue
     });
-    const written = !!(await Promise.resolve(onTrustedText(writeValue)));
+    const written = !!(await Promise.resolve(onTrustedText(writeValue, control)));
+    const confirmed = written && await waitForStableCondition(
+      () => isIssControlReady(control) && readIssFilterTextControl(control) === target,
+      2500, 60, 180, signal);
     emitDiagnostic(onLog, 'ISS_CORRETORA_TEXT_AFTER', 'Valor do campo imediatamente após a escrita confiável.', {
       target: describeActionTarget(control),
       writeAccepted: written,
       currentValue: readIssFilterTextControl(control),
       targetValue: target
     });
-    return written;
+    return confirmed;
+  }
+
+  async function confirmIssSettlementBank(control, options) {
+    const opts = options || {};
+    if (!control) return false;
+    // O Protheus pode completar o banco e avançar para Agência durante
+    // Input.insertText. A guarda bloqueia o evento seguinte, mas o retorno
+    // da escrita fica false mesmo quando o próprio banco já está correto.
+    await dispatchIssFilterTextControl(control, '033', opts);
+    const resolve = typeof opts.resolveControl === 'function' ? opts.resolveControl : () => control;
+    const confirmed = () => {
+      const current = resolve();
+      return isIssControlReady(current) && readIssSettlementFieldValue(current) === '033';
+    };
+    if (!await waitForStableCondition(confirmed, 2500, 80, 180, opts.signal)) return false;
+    const current = resolve();
+    if (hasIssInputFocus(current) &&
+        (typeof opts.onTrustedKey !== 'function' || !await opts.onTrustedKey('Tab', current))) return false;
+    return !!(await waitForStableCondition(confirmed, 2500, 80, 180, opts.signal));
   }
 
 
@@ -1768,8 +1936,10 @@
     const onTrustedClick = typeof opts.onTrustedClick === 'function' ? opts.onTrustedClick : null;
     const onTrustedKey = typeof opts.onTrustedKey === 'function' ? opts.onTrustedKey : null;
     const onLog = typeof opts.onLog === 'function' ? opts.onLog : null;
-    if (readIssFilterTextControl(control) === target) return true;
     if (!onTrustedKey || digits.length !== 8) return false;
+    control = await waitForIssInputReady(control, opts, true);
+    if (!control) return false;
+    if (readIssFilterTextControl(control) === target) return true;
 
     emitDiagnostic(onLog, 'ISS_CORRETORA_DATE_BEFORE', 'Valor atual do campo de data antes da digitação por teclas confiáveis.', {
       target: describeActionTarget(control),
@@ -1779,32 +1949,54 @@
 
     if (onTrustedClick) {
       const clicked = await Promise.resolve(onTrustedClick(control));
-      if (!clicked && !focusIssFilterTextControl(control)) return false;
-      await abortableSleep(60, signal);
+      if (!clicked) return false;
     }
-    if (!focusIssFilterTextControl(control)) return false;
+    control = await waitForIssInputReady(control, opts, 'mask');
+    if (!control || !focusIssFilterTextControl(control)) return false;
+    const input = getInnerEditable(control);
+    const signature = issInputSignature(control);
+    const sameEditor = () => getInnerEditable(control) === input && issInputSignature(control) === signature;
+    let prefix = '';
 
     for (const digit of digits) {
       throwIfAborted(signal);
-      if (!focusIssFilterTextControl(control, { selectAll: false })) return false;
-      const sent = !!(await Promise.resolve(onTrustedKey(digit)));
+      // Não force foco a cada tecla: perder o foco durante a escrita é um
+      // estado de erro, não uma autorização para continuar em outro campo.
+      if (!sameEditor() || !hasIssInputFocus(control)) {
+        emitDiagnostic(onLog, 'ISS_INPUT_GUARD_BLOCKED', 'Digitação interrompida: o input foi recriado ou perdeu foco.', { target: describeActionTarget(control), digitsConfirmed: prefix.length });
+        return false;
+      }
+      const sent = !!(await Promise.resolve(onTrustedKey(digit, control)));
       if (!sent) return false;
-      await abortableSleep(20, signal);
+      prefix += digit;
+      const acknowledged = await waitForCondition(() =>
+        isIssControlReady(control) && sameEditor() &&
+        readIssFilterTextControl(control).replace(/\D/g, '') === prefix, 1000, 40, signal);
+      if (!acknowledged) return false;
     }
 
     throwIfAborted(signal);
-    if (!focusIssFilterTextControl(control, { selectAll: false })) return false;
-    const committed = !!(await Promise.resolve(onTrustedKey('Tab')));
-    if (!committed) return false;
+    // A máscara pode avançar automaticamente após o oitavo dígito (gravação).
+    // Nesse caso não refocalize nem envie um segundo Tab para outro controle.
+    let commitKey = null;
+    if (!sameEditor()) return false;
+    if (hasIssInputFocus(control)) {
+      if (!await Promise.resolve(onTrustedKey('Tab', control))) return false;
+      commitKey = 'Tab';
+    }
+    const confirmed = await waitForStableCondition(() =>
+      isIssControlReady(control) && sameEditor() &&
+      readIssFilterTextControl(control) === target, 2500, 60, 240, signal);
 
-    emitDiagnostic(onLog, 'ISS_CORRETORA_DATE_AFTER', 'Sequência de teclas da data enviada ao Protheus e campo confirmado por Tab.', {
+    emitDiagnostic(onLog, 'ISS_CORRETORA_DATE_AFTER', 'Data validada após digitação e saída do campo.', {
       target: describeActionTarget(control),
       currentValue: readIssFilterTextControl(control),
       targetValue: target,
       keyCount: digits.length,
-      commitKey: 'Tab'
+      commitKey,
+      confirmed
     });
-    return true;
+    return confirmed;
   }
 
   async function fillIssFilterTextControl(control, value, options) {
@@ -1867,6 +2059,924 @@
     });
   }
 
+  function parseIssProtheusCurrencyCents(value) {
+    const raw = String(value == null ? '' : value).trim();
+    if (!raw) return 0;
+    const negative = /^\s*-/.test(raw);
+    const normalized = raw.replace(/[^0-9,.-]/g, '').replace(/\./g, '').replace(',', '.');
+    const numeric = Number(normalized);
+    if (!Number.isFinite(numeric)) return 0;
+    const cents = Math.round(Math.abs(numeric) * 100);
+    return negative ? -cents : cents;
+  }
+
+  function parseIssProtheusGridMatrix(headers, rows) {
+    const sourceHeaders = Array.isArray(headers) ? headers : [];
+    const sourceRows = Array.isArray(rows) ? rows : [];
+    const headerIndex = new Map();
+    sourceHeaders.forEach((header, index) => headerIndex.set(normalizeText(header), index));
+
+    const fields = [
+      ['prefix', 'Prefixo'], ['title', 'No. Titulo'], ['installment', 'Parcela'], ['type', 'Tipo'],
+      ['supplier', 'Fornecedor'], ['store', 'Loja'], ['supplierName', 'Nome Fornece'],
+      ['nature', 'Natureza'], ['natureDescription', 'Desc. Natur.'], ['issueDate', 'DT Emissao'],
+      ['dueDate', 'Vencimento'], ['actualDueDate', 'Vencto Real'], ['titleValueText', 'Vlr.Titulo']
+    ];
+    const missing = fields.filter((field) => !headerIndex.has(normalizeText(field[1]))).map((field) => field[1]);
+    if (missing.length) {
+      throw new Error('ISS Corretora: a grade do Protheus não contém as colunas obrigatórias: ' + missing.join(', ') + '.');
+    }
+
+    return sourceRows.map((row) => {
+      const cells = Array.isArray(row) ? row : [];
+      const record = {};
+      fields.forEach(([key, label]) => {
+        const value = cells[headerIndex.get(normalizeText(label))];
+        record[key] = String(value == null ? '' : value).trim();
+      });
+      record.settlementDate = headerIndex.has(normalizeText('DT Baixa'))
+        ? String(cells[headerIndex.get(normalizeText('DT Baixa'))] || '').trim() : '';
+      record.titleValueCents = parseIssProtheusCurrencyCents(record.titleValueText);
+      record.identity = [record.prefix, record.title, record.installment, record.type, record.supplier, record.store].join('|');
+      return record;
+    }).filter((record) => record.identity.replace(/\|/g, '') !== '');
+  }
+
+  function getIssProtheusPageFingerprint(records) {
+    const list = Array.isArray(records) ? records : [];
+    if (!list.length) return 'empty';
+    return [list.length, list[0].identity, list[list.length - 1].identity].join('::');
+  }
+
+  function armIssGridPageClickValidation(control, readPage, expectedFingerprint) {
+    let pageChanged = false;
+    const guard = armIssClickValidation(control, () => {
+      const current = getIssProtheusPageFingerprint(readPage());
+      if (current === expectedFingerprint) return;
+      pageChanged = true;
+      throw new Error('ISS Corretora: a página da grade mudou antes do clique de repetição.');
+    });
+    return {
+      pageChanged: () => pageChanged,
+      error: guard.error,
+      release: guard.release
+    };
+  }
+
+  function buildIssProtheusRecordsSummary(records) {
+    const list = Array.isArray(records) ? records : [];
+    const uniqueValue = (key, multipleLabel) => {
+      const values = Array.from(new Set(list.map((item) => String(item && item[key] || '').trim()).filter(Boolean)));
+      return values.length === 1 ? values[0] : (values.length > 1 ? multipleLabel : '—');
+    };
+    return {
+      recordCount: list.length,
+      totalTitleValueCents: list.reduce((total, item) => total + (Number(item && item.titleValueCents) || 0), 0),
+      issCount: list.filter((item) => normalizeText(item && item.type) === 'iss').length,
+      txCount: list.filter((item) => normalizeText(item && item.type) === 'tx').length,
+      actualDueDate: uniqueValue('actualDueDate', 'Múltiplos'),
+      nature: uniqueValue('nature', 'Múltiplas')
+    };
+  }
+
+  function buildIssProtheusSummarySections(summaryData, reconciliationData) {
+    const summary = summaryData || {};
+    const reconciliation = reconciliationData || {};
+    const pluralTitles = Number(reconciliation.subsetSelectedCount) === 1 ? 'título' : 'títulos';
+    return [
+      {
+        id: 'settlement',
+        title: 'Conciliação da guia',
+        items: [
+          { id: 'guide', label: 'Total da guia', valueCents: reconciliation.guideTotalCents, tone: 'blue' },
+          { id: 'direct', label: 'Baixas diretas', valueCents: reconciliation.directSettlementValueCents, tone: 'green' },
+          ...(Number(reconciliation.alreadyPaidUnmatchedValueCents) > 0 ? [{
+            id: 'already-paid', label: 'Já baixados sem par no CSV',
+            valueCents: reconciliation.alreadyPaidUnmatchedValueCents, tone: 'slate'
+          }] : []),
+          { id: 'missing', label: 'Valor faltante', valueCents: reconciliation.subsetTargetCents, tone: 'amber' },
+          {
+            id: 'subset', label: 'Subconjunto escolhido', valueCents: reconciliation.subsetSelectedValueCents,
+            detail: String(Number(reconciliation.subsetSelectedCount) || 0) + ' ' + pluralTitles, tone: 'purple'
+          },
+          { id: 'residual', label: 'Saldo residual', valueCents: reconciliation.subsetResidualCents, tone: 'slate' }
+        ]
+      },
+      {
+        id: 'protheus',
+        title: 'Resumo do Protheus',
+        items: [
+          { id: 'records', label: 'Total de registros', value: summary.recordCount },
+          { id: 'total', label: 'Valor total', valueCents: summary.totalTitleValueCents },
+          { id: 'iss', label: 'Títulos ISS', value: summary.issCount },
+          { id: 'tx', label: 'Títulos TX', value: summary.txCount },
+          { id: 'due-date', label: 'Vencto real', value: summary.actualDueDate },
+          { id: 'nature', label: 'Natureza', value: summary.nature }
+        ]
+      },
+      {
+        id: 'conference',
+        title: 'Conferência com a Prefeitura',
+        items: [
+          {
+            id: 'matched', label: 'Correspondências diretas', value: reconciliation.matchedCount,
+            detailCents: reconciliation.matchedValueCents
+          },
+          { id: 'one-cent', label: 'Diferença de R$ 0,01', value: reconciliation.oneCentMatchedCount },
+          {
+            id: 'not-found', label: 'ISS não encontrados', value: reconciliation.notFoundCount,
+            detailCents: reconciliation.notFoundValueCents
+          },
+          {
+            id: 'municipal-only', label: 'Prefeitura sem título', value: reconciliation.unmatchedMunicipalCount,
+            detailCents: reconciliation.unmatchedMunicipalValueCents
+          }
+        ]
+      }
+    ];
+  }
+
+  async function findBestIssSubset(items, targetCents, options) {
+    const opts = options || {};
+    throwIfAborted(opts.signal);
+    const target = Number(targetCents);
+    if (!Number.isSafeInteger(target) || target <= 0) {
+      return {
+        selectedIndexes: [],
+        selectedValueCents: 0,
+        residualCents: Math.max(0, Number.isSafeInteger(target) ? target : 0),
+        candidateCount: 0
+      };
+    }
+
+    const source = Array.isArray(items) ? items : [];
+    const candidates = source.map((item, index) => ({
+      index,
+      cents: Number(item && item.titleValueCents)
+    })).filter((item) => Number.isSafeInteger(item.cents) && item.cents > 0 && item.cents <= target);
+
+    const candidateTotal = candidates.reduce((sum, item) => sum + item.cents, 0);
+    const searchLimit = Math.min(target, candidateTotal);
+    if (searchLimit <= 0) {
+      return { selectedIndexes: [], selectedValueCents: 0, residualCents: target, candidateCount: candidates.length };
+    }
+    if (candidateTotal <= target) {
+      return {
+        selectedIndexes: candidates.map((candidate) => candidate.index),
+        selectedValueCents: candidateTotal,
+        residualCents: target - candidateTotal,
+        candidateCount: candidates.length
+      };
+    }
+
+    const unreachable = 0x7fffffff;
+    const rowBytes = Math.ceil((searchLimit + 1) / 8);
+    const estimatedDpBytes = ((searchLimit + 1) * 4) + (candidates.length * rowBytes);
+    const maxDpBytes = 128 * 1024 * 1024;
+    if (!Number.isSafeInteger(estimatedDpBytes) || estimatedDpBytes > maxDpBytes) {
+      throw new Error('ISS Corretora: o cálculo do subconjunto excedeu o limite de memória segura. Reduza os títulos candidatos antes de continuar.');
+    }
+    const counts = new Int32Array(searchLimit + 1);
+    counts.fill(unreachable);
+    counts[0] = 0;
+    const decisions = candidates.map(() => new Uint8Array(rowBytes));
+    let workUntilYield = 65536;
+    let lastYieldAt = Date.now();
+
+    for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+      const candidate = candidates[candidateIndex];
+      for (let sum = searchLimit; sum >= candidate.cents; sum--) {
+        if (--workUntilYield === 0) {
+          throwIfAborted(opts.signal);
+          if (Date.now() - lastYieldAt >= 8) {
+            await abortableSleep(0, opts.signal);
+            lastYieldAt = Date.now();
+          }
+          workUntilYield = 65536;
+        }
+        const prior = sum - candidate.cents;
+        if (counts[prior] === unreachable) continue;
+        const nextCount = counts[prior] + 1;
+        if (nextCount >= counts[sum]) continue;
+        counts[sum] = nextCount;
+        decisions[candidateIndex][sum >> 3] |= 1 << (sum & 7);
+      }
+      throwIfAborted(opts.signal);
+      if (candidateIndex % 4 === 3) await abortableSleep(0, opts.signal);
+    }
+
+    let best = searchLimit;
+    while (best > 0 && counts[best] === unreachable) best--;
+    const selectedIndexes = [];
+    let remaining = best;
+    for (let candidateIndex = candidates.length - 1; candidateIndex >= 0 && remaining > 0; candidateIndex--) {
+      const selected = (decisions[candidateIndex][remaining >> 3] & (1 << (remaining & 7))) !== 0;
+      if (!selected) continue;
+      selectedIndexes.push(candidates[candidateIndex].index);
+      remaining -= candidates[candidateIndex].cents;
+    }
+    selectedIndexes.sort((left, right) => left - right);
+
+    return {
+      selectedIndexes,
+      selectedValueCents: best,
+      residualCents: target - best,
+      candidateCount: candidates.length
+    };
+  }
+
+  function reconcileIssMunicipalWithProtheus(municipalRecords, protheusRecords) {
+    const municipal = Array.isArray(municipalRecords) ? municipalRecords : [];
+    const protheus = Array.isArray(protheusRecords) ? protheusRecords : [];
+    const municipalEntries = municipal.map((record, index) => ({ record: record || {}, index, used: false }));
+    const availableByValue = new Map();
+
+    municipalEntries.forEach((entry) => {
+      const cents = Number(entry.record.issDueCents);
+      if (!Number.isSafeInteger(cents) || cents < 0) return;
+      if (!availableByValue.has(cents)) availableByValue.set(cents, []);
+      availableByValue.get(cents).push(entry);
+    });
+
+    const records = protheus.map((sourceRecord) => {
+      const record = Object.assign({}, sourceRecord || {});
+      record.municipalMatchStatus = 'not-found';
+      record.municipalMatchKind = 'none';
+      record.municipalSourceType = '';
+      record.municipalNfseNumber = '';
+      record.municipalGuideNumber = '';
+      record.municipalServiceCode = '';
+      record.municipalIssDueCents = 0;
+      record.municipalDifferenceCents = 0;
+      record.shouldSettle = false;
+      return record;
+    });
+
+    const takeAvailableByValue = (cents) => {
+      const queue = availableByValue.get(cents);
+      if (!queue) return null;
+      while (queue.length && queue[0].used) queue.shift();
+      return queue.length ? queue.shift() : null;
+    };
+
+    const peekAvailableByValue = (cents) => {
+      const queue = availableByValue.get(cents);
+      if (!queue) return null;
+      while (queue.length && queue[0].used) queue.shift();
+      return queue.length ? queue[0] : null;
+    };
+
+    const applyMatch = (record, match, kind) => {
+      if (!record || !match) return false;
+      match.used = true;
+      record.municipalMatchStatus = 'matched';
+      record.municipalMatchKind = kind;
+      record.municipalSourceType = String(match.record.sourceType || '');
+      record.municipalNfseNumber = String(match.record.nfseNumber || '');
+      record.municipalGuideNumber = String(match.record.guideNumber || '');
+      record.municipalServiceCode = String(match.record.serviceCode || '');
+      record.municipalIssDueCents = Number(match.record.issDueCents) || 0;
+      record.municipalDifferenceCents = Number(record.titleValueCents) - Number(match.record.issDueCents);
+      record.shouldSettle = true;
+      return true;
+    };
+
+    // Primeira análise: reserva todos os valores exatos antes de usar tolerância.
+    records.forEach((record) => {
+      const cents = Number(record.titleValueCents);
+      if (!Number.isSafeInteger(cents) || cents < 0) return;
+      applyMatch(record, takeAvailableByValue(cents), 'exact');
+    });
+
+    // Segunda análise: somente títulos ainda não encontrados, com limite absoluto de um centavo.
+    records.forEach((record) => {
+      if (record.municipalMatchStatus === 'matched') return;
+      const cents = Number(record.titleValueCents);
+      if (!Number.isSafeInteger(cents) || cents < 0) return;
+      const candidates = [peekAvailableByValue(cents - 1), peekAvailableByValue(cents + 1)]
+        .filter(Boolean).sort((left, right) => left.index - right.index);
+      const selected = candidates[0] || null;
+      if (!selected) return;
+      const municipalCents = Number(selected.record.issDueCents);
+      applyMatch(record, takeAvailableByValue(municipalCents), 'one-cent');
+    });
+
+    const unmatchedMunicipalRecords = municipalEntries.filter((entry) => !entry.used).map((entry) => entry.record);
+    const matched = records.filter((record) => record.municipalMatchStatus === 'matched');
+    const notFound = records.filter((record) => record.municipalMatchStatus === 'not-found');
+    return {
+      records,
+      unmatchedMunicipalRecords,
+      summary: {
+        matchedCount: matched.length,
+        matchedValueCents: matched.reduce((sum, record) => sum + (Number(record.titleValueCents) || 0), 0),
+        exactMatchedCount: matched.filter((record) => record.municipalMatchKind === 'exact').length,
+        oneCentMatchedCount: matched.filter((record) => record.municipalMatchKind === 'one-cent').length,
+        notFoundCount: notFound.length,
+        notFoundValueCents: notFound.reduce((sum, record) => sum + (Number(record.titleValueCents) || 0), 0),
+        notApplicableCount: records.length - matched.length - notFound.length,
+        unmatchedMunicipalCount: unmatchedMunicipalRecords.length,
+        unmatchedMunicipalValueCents: unmatchedMunicipalRecords.reduce((sum, record) => sum + (Number(record && record.issDueCents) || 0), 0)
+      }
+    };
+  }
+
+  async function applyIssSubsetSelection(reconciliation, guideTotalCents, options) {
+    const source = reconciliation && typeof reconciliation === 'object' ? reconciliation : {};
+    const result = Object.assign({}, source, {
+      records: (Array.isArray(source.records) ? source.records : []).map((record) => Object.assign({}, record)),
+      summary: Object.assign({}, source.summary || {}),
+      unmatchedMunicipalRecords: Array.isArray(source.unmatchedMunicipalRecords)
+        ? source.unmatchedMunicipalRecords.slice() : []
+    });
+    const guideTotal = Number(guideTotalCents);
+    if (!Number.isSafeInteger(guideTotal) || guideTotal <= 0)
+      throw new Error('ISS Corretora: total pago da guia inválido; baixa bloqueada.');
+
+    result.records.forEach((record) => {
+      const date = String(record.settlementDate || '').trim();
+      const hasDate = date.replace(/[\s/]/g, '') !== '';
+      if (hasDate && !/^\d{2}\/\d{2}\/\d{4}$/.test(date))
+        throw new Error('ISS Corretora: DT Baixa ilegível para ' + record.identity + '; cálculo da guia bloqueado.');
+      record.settlementSource = record.shouldSettle === true ? 'direct' : hasDate ? 'already-paid' : 'none';
+      if (record.settlementSource === 'already-paid') record.shouldSettle = true;
+    });
+    const directSettlementValueCents = result.records
+      .filter((record) => record.settlementSource === 'direct')
+      .reduce((sum, record) => sum + (Number.isSafeInteger(Number(record.titleValueCents)) ? Number(record.titleValueCents) : 0), 0);
+    const alreadyPaidUnmatchedValueCents = result.records
+      .filter((record) => record.settlementSource === 'already-paid')
+      .reduce((sum, record) => sum + (Number.isSafeInteger(Number(record.titleValueCents)) ? Number(record.titleValueCents) : 0), 0);
+    if (directSettlementValueCents + alreadyPaidUnmatchedValueCents > guideTotal)
+      throw new Error('ISS Corretora: títulos diretos e já baixados excedem o total pago na guia; baixa bloqueada.');
+    const subsetTargetCents = guideTotal - directSettlementValueCents - alreadyPaidUnmatchedValueCents;
+    const candidateRecords = result.records.filter((record) => record.settlementSource === 'none');
+    const subset = await findBestIssSubset(candidateRecords, subsetTargetCents, options);
+    const selectedIndexes = new Set(subset.selectedIndexes);
+
+    candidateRecords.forEach((record, index) => {
+      if (!selectedIndexes.has(index)) return;
+      record.shouldSettle = true;
+      record.settlementSource = 'subset';
+    });
+
+    Object.assign(result.summary, {
+      guideTotalCents: guideTotal,
+      directSettlementValueCents,
+      alreadyPaidUnmatchedValueCents,
+      subsetTargetCents,
+      subsetCandidateCount: subset.candidateCount,
+      subsetSelectedCount: subset.selectedIndexes.length,
+      subsetSelectedValueCents: subset.selectedValueCents,
+      subsetResidualCents: subset.residualCents,
+      totalSettlementValueCents: directSettlementValueCents + alreadyPaidUnmatchedValueCents + subset.selectedValueCents
+    });
+    return result;
+  }
+
+  function getIssRunDisplayOptions(options) {
+    const source = options && typeof options === 'object' ? options : {};
+    return {
+      showGuideConference: source.showGuideConference === true,
+      showProtheusRecords: source.showProtheusRecords === true,
+      settleAllRecords: source.settleAllRecords === true,
+      startAfterFilter: source.startAfterFilter === true,
+      pauseAtDueDate: source.pauseAtDueDate === true
+    };
+  }
+
+  function chooseIssReadyControl(nodes) {
+    const ready = [...new Set(Array.isArray(nodes) ? nodes : [])].filter(isIssControlReady);
+    return ready.length === 1 ? ready[0] : null;
+  }
+
+  function isIssSettlementMenuItemSelected(node, expectedCaption) {
+    const caption = String(node && node.getAttribute && node.getAttribute('caption') || '')
+      .replace(/<[^>]*>/g, '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    if (caption !== expectedCaption || !node.classList || !node.classList.contains('selected')) return false;
+    if (expectedCaption === 'baixa manual') return node.classList.contains('expanded');
+    if (expectedCaption === 'baixar') return isIssSettlementMenuItemSelected(node.parentElement, 'baixa manual');
+    return false;
+  }
+
+  async function openIssSettlementMenu(options) {
+    const opts = options || {};
+    const wait = opts.wait;
+    const maxOpenAttempts = 5;
+    const openIntervalMs = 3000;
+    const report = (category, message, data) => emitDiagnostic(opts.onLog, category, message, data);
+
+    // Outras Ações alterna o menu: nunca clicar novamente se Baixa Manual
+    // já estiver visível (mesmo que ainda não esteja pronto para receber hover).
+    if (!await wait(() => !!opts.findOther() || !!opts.findManual(), 4000))
+      throw new Error('ISS Corretora: Outras Ações não está disponível no diálogo ativo; confira janelas abertas.');
+
+    let menuReady = !!opts.findManual();
+    for (let attempt = 1; !menuReady && attempt <= maxOpenAttempts; attempt++) {
+      throwIfAborted(opts.signal);
+      // Um item ainda em transição pode existir no DOM mas não estar clicável.
+      // Neste caso não alternamos Outras Ações: apenas esperamos ficar pronto.
+      const menuRendered = !!(opts.findManualAny && opts.findManualAny());
+      const other = !menuRendered ? opts.findOther() : null;
+      if (opts.onStatus) opts.onStatus('ISS CORRETORA — abrindo Outras Ações (' + attempt + '/' + maxOpenAttempts + ')...');
+      let clicked = false;
+      if (other) clicked = !!(await opts.trustedClick(other));
+      report('ISS_SETTLEMENT_MENU_ATTEMPT', 'Verificando abertura de Outras Ações para Baixa Manual.', {
+        attempt, maxAttempts: maxOpenAttempts, clicked, menuRendered
+      });
+      // A cada 3 segundos, verifica a presença da opção antes de autorizar
+      // qualquer novo clique; também reavalia se o CDP retornou false.
+      menuReady = !!(await wait(() => !!opts.findManual(), openIntervalMs));
+      if (menuReady) break;
+      if (attempt < maxOpenAttempts) {
+        report('ISS_SETTLEMENT_MENU_RETRY', 'Baixa Manual ainda não apareceu; aguardando para readquirir Outras Ações.', {
+          attempt, nextAttempt: attempt + 1, intervalMs: openIntervalMs
+        });
+      }
+    }
+    if (!menuReady)
+      throw new Error('ISS Corretora: opção Baixa Manual não apareceu após 5 verificações de Outras Ações (intervalos de 3 segundos).');
+
+    report('ISS_SETTLEMENT_MENU_READY', 'Opção Baixa Manual encontrada; nenhuma nova abertura de Outras Ações será enviada.');
+    if (!await opts.trustedHover(opts.findManual()) ||
+        !await wait(() => isIssSettlementMenuItemSelected(opts.findManual(), 'baixa manual'), 4000))
+      throw new Error('ISS Corretora: submenu Baixa Manual não ficou expandido e selecionado.');
+    if (!await wait(() => !!opts.findAction(), 4000))
+      throw new Error('ISS Corretora: submenu abriu mas a opção Baixar não ficou visível.');
+    const action = opts.findAction();
+    if (!action || !await opts.trustedHover(action) ||
+        !await wait(() => isIssSettlementMenuItemSelected(opts.findAction(), 'baixar'), 2000))
+      throw new Error('ISS Corretora: opção Baixar não ficou selecionada; nenhuma baixa iniciada.');
+    // Baixar abre a operação financeira: clique único, sem retry cego.
+    if (!await opts.trustedClick(action)) return null;
+    if (!await wait(() => !!opts.dialog(), 5000)) return null;
+    return opts.dialog();
+  }
+
+  function assertIssPreappliedFilter(records, rules) {
+    if (!Array.isArray(records) || !records.length) throw new Error('ISS Corretora: filtro pré-aplicado sem registros para conferência.');
+    const fields = { Natureza: 'nature', 'Vencto Real': 'actualDueDate' };
+    if (!Array.isArray(rules) || rules.length !== 2 ||
+        !rules.some((rule) => rule.field === 'Natureza' && String(rule.value) === '20505') ||
+        !rules.some((rule) => rule.field === 'Vencto Real' && /^10\/\d{2}\/\d{4}$/.test(String(rule.value))))
+      throw new Error('ISS Corretora: regras do filtro pré-aplicado não foram definidas com segurança.');
+    for (const rule of rules || []) {
+      const field = String(rule && rule.field || '');
+      const key = fields[field];
+      if (!key || !records.every((record) => normalizeText(record && record[key]) === normalizeText(rule.value))) {
+        throw new Error('ISS Corretora: filtro pré-aplicado não confere com ' + field + '; nenhuma baixa iniciada.');
+      }
+    }
+    return true;
+  }
+
+  function chooseFirstIssSettlementRecord(records) {
+    return (Array.isArray(records) ? records : []).find((item) => item && item.shouldSettle === true &&
+      !/^\d{2}\/\d{2}\/\d{4}$/.test(String(item.settlementDate || '').trim())) || null;
+  }
+
+  function planIssSettlementBatch(records) {
+    const pending = [];
+    const alreadyPaid = [];
+    const seen = new Set();
+    for (const record of Array.isArray(records) ? records : []) {
+      if (!record || record.shouldSettle !== true) continue;
+      if (!record.identity || seen.has(record.identity) ||
+          !Number.isSafeInteger(record.titleValueCents) || record.titleValueCents <= 0)
+        throw new Error('ISS Corretora: título SIM duplicado ou sem identificação/valor válido; lote bloqueado.');
+      seen.add(record.identity);
+      const date = String(record.settlementDate || '').trim();
+      const hasDate = date.replace(/[\s/]/g, '') !== '';
+      if (hasDate && !/^\d{2}\/\d{2}\/\d{4}$/.test(date))
+        throw new Error('ISS Corretora: DT Baixa ilegível para ' + record.identity + '; lote bloqueado.');
+      (hasDate ? alreadyPaid : pending).push(record);
+    }
+    return { pending, alreadyPaid, totalCents: pending.reduce((sum, record) => sum + record.titleValueCents, 0) };
+  }
+
+  async function runIssSettlementBatch(records, options) {
+    const opts = options || {};
+    const plan = planIssSettlementBatch(records);
+    const result = { ...plan, settled: [], cancelled: false };
+    if (!plan.pending.length) return result;
+    if (typeof opts.confirm !== 'function' || typeof opts.settle !== 'function')
+      throw new Error('ISS Corretora: confirmação e execução do lote indisponíveis.');
+    throwIfAborted(opts.signal);
+    if (!await opts.confirm(plan)) return { ...result, cancelled: true };
+    for (const record of plan.pending) {
+      throwIfAborted(opts.signal);
+      if (opts.onProgress) opts.onProgress(record, result.settled.length, plan.pending.length);
+      const confirmed = await opts.settle(record);
+      if (!confirmed || confirmed.identity !== record.identity)
+        throw new Error('ISS Corretora: baixa de ' + record.identity + ' não foi confirmada; lote interrompido.');
+      result.settled.push(record);
+    }
+    return result;
+  }
+
+  function isIssSettlementConfirmed(record, rows, expectedDate) {
+    if (!record || !record.identity || !/^\d{2}\/\d{2}\/\d{4}$/.test(String(expectedDate || ''))) return false;
+    const matches = (Array.isArray(rows) ? rows : []).filter((entry) => entry && entry.identity === record.identity);
+    return matches.length === 1 && matches[0].titleValueCents === record.titleValueCents &&
+      String(matches[0].settlementDate || '').trim() === expectedDate;
+  }
+
+  function isIssSettlementGridReady(doc) {
+    try { return assertIssGridUnblocked(doc); } catch (_) { return false; }
+  }
+
+  function readIssSettlementFieldValue(control) {
+    if (!control) return '';
+    let inner = null;
+    try { inner = control.shadowRoot && control.shadowRoot.querySelector('input,textarea,select'); } catch (_) {}
+    return String(inner && inner.value != null ? inner.value : control.value == null ? '' : control.value).trim();
+  }
+
+  function getIssSettlementIdentityDifferences(record, form) {
+    const keys = ['prefix', 'title', 'installment', 'type', 'supplier'];
+    const differences = keys.filter((key) => !form || String(form[key] || '').trim() !== String(record && record[key] || '').trim());
+    if (!form || !record || !Number.isSafeInteger(record.titleValueCents) || record.titleValueCents <= 0 ||
+        form.paymentValueCents !== record.titleValueCents) differences.push('paymentValueCents');
+    return differences;
+  }
+
+  function assertIssSettlementForm(record, form) {
+    if (getIssSettlementIdentityDifferences(record, form).length ||
+        form.reason !== 'DEBITO CC' || form.bank !== '033' ||
+        !/^\d{2}\/\d{2}\/\d{4}$/.test(form.paymentDate || '') ||
+        form.paymentDate !== form.debitDate) {
+      throw new Error('ISS Corretora: formulário de baixa divergente; Salvar bloqueado. Confira título, banco, motivo, datas e valor.');
+    }
+  }
+
+  async function runIssSingleSettlement(record, adapter, options) {
+    const opts = options || {};
+    if (!record || record.shouldSettle !== true || !record.identity ||
+        /^\d{2}\/\d{2}\/\d{4}$/.test(String(record.settlementDate || '').trim()))
+      throw new Error('ISS Corretora: título para baixa não foi confirmado ou já possui data de baixa.');
+    throwIfAborted(opts.signal);
+    const located = await adapter.locate(record);
+    if (!located || located.identity !== record.identity || located.titleValueCents !== record.titleValueCents ||
+        /^\d{2}\/\d{2}\/\d{4}$/.test(String(located.settlementDate || '').trim()))
+      throw new Error('ISS Corretora: linha selecionada divergente; nenhuma baixa iniciada.');
+    const opened = await adapter.open(record);
+    if (!opened) throw new Error('ISS Corretora: janela de baixa não abriu.');
+    const prepared = await adapter.configure(record, opened);
+    assertIssSettlementForm(record, prepared);
+    throwIfAborted(opts.signal);
+    if (!await adapter.approve(record, prepared)) {
+      if (adapter.cancel && !await adapter.cancel()) throw new Error('ISS Corretora: cancelamento da janela não foi confirmado.');
+      return null;
+    }
+    // Leia de novo imediatamente antes do clique: a aprovação humana não autoriza
+    // uma janela ou um título que mudou durante a confirmação.
+    const finalForm = adapter.read ? await adapter.read(record) : prepared;
+    assertIssSettlementForm(record, finalForm);
+    throwIfAborted(opts.signal);
+    if (!await adapter.save(record, finalForm)) throw new Error('ISS Corretora: clique em Salvar recusado; não repetir automaticamente.');
+    if (!await adapter.verify(record, finalForm)) throw new Error('ISS Corretora: o Protheus não confirmou a baixa; confira manualmente antes de tentar novamente.');
+    return record;
+  }
+
+  async function settleIssRecordInProtheus(doc, record, options) {
+    const opts = options || {};
+    const signal = opts.signal;
+    const trustedClick = opts.onTrustedClick;
+    const trustedHover = opts.onTrustedHover;
+    const trustedText = opts.onTrustedText;
+    const trustedKey = opts.onTrustedKey;
+    const caption = (node) => String(node && node.getAttribute && node.getAttribute('caption') || '')
+      .replace(/<[^>]*>/g, '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    if (typeof trustedClick !== 'function' || typeof trustedText !== 'function' ||
+        typeof trustedKey !== 'function' || typeof trustedHover !== 'function' || typeof opts.onApprove !== 'function')
+      throw new Error('ISS Corretora: controles confiáveis da baixa não estão disponíveis.');
+    const unique = (scope, selector, predicate, requireReady) => {
+      const nodes = [...new Set(collectRoots(scope).flatMap((root) => {
+        try { return Array.from(root.querySelectorAll(selector)); } catch (_) { return []; }
+      }))].filter((node) => isElementStateActive(node) && (!predicate || predicate(node)));
+      return requireReady ? chooseIssReadyControl(nodes) : (nodes.length === 1 ? nodes[0] : null);
+    };
+    const dialog = () => unique(doc, 'wa-dialog[title="Baixas a Pagar"]', null, true);
+    const field = (name) => {
+      const panel = dialog();
+      return panel && unique(panel, 'wa-text-input,wa-combobox', (node) => node.getAttribute('name') === name);
+    };
+    const value = (name) => {
+      const control = field(name);
+      return readIssSettlementFieldValue(control);
+    };
+    const readForm = () => {
+      const reason = field('cMotBx');
+      return dialog() && reason ? {
+        prefix: value('SE2->E2_PREFIXO'), title: value('SE2->E2_NUM'), installment: value('SE2->E2_PARCELA'),
+        type: value('cTipo'), supplier: value('SE2->E2_FORNECE'),
+        reason: readIssFilterComboboxText(reason).toUpperCase(), bank: value('cBanco'),
+        paymentDate: value('dBaixa'), debitDate: value('dDebito'),
+        paymentValueCents: parseIssProtheusCurrencyCents(value('nValPgto'))
+      } : null;
+    };
+    const readRows = () => {
+      const grid = findIssProtheusGrid(doc);
+      const root = grid && grid.shadowRoot;
+      if (!root) throw new Error('ISS Corretora: grade não encontrada para a baixa.');
+      const headers = Array.from(root.querySelectorAll('thead th')).map((th) => String(th.innerText || th.textContent || '').trim());
+      if (!headers.some((header) => normalizeText(header) === 'dt baixa'))
+        throw new Error('ISS Corretora: coluna DT Baixa ausente; não é seguro prosseguir.');
+      return Array.from(root.querySelectorAll('tbody tr')).map((row) => ({
+        row, record: parseIssProtheusGridMatrix(headers, [Array.from(row.querySelectorAll('td')).map((cell) => String(cell.innerText || cell.textContent || '').trim())])[0]
+      }));
+    };
+    const adapter = {
+      locate: async (wanted) => {
+        const seen = new Set();
+        for (let page = 0; page < 500; page++) {
+          throwIfAborted(signal);
+          const rows = readRows();
+          const hit = rows.find((entry) => entry.record && entry.record.identity === wanted.identity);
+          if (hit) {
+            const cell = hit.row.querySelectorAll('td')[2];
+            if (!cell || !await trustedClick(cell)) throw new Error('ISS Corretora: seleção do título recusada.');
+            const selected = readRows().filter((entry) => isTableRowSelected(entry.row));
+            if (selected.length !== 1 || selected[0].record.identity !== wanted.identity)
+              throw new Error('ISS Corretora: Protheus não confirmou a seleção do título.');
+            return selected[0].record;
+          }
+          const fingerprint = getIssProtheusPageFingerprint(rows.map((entry) => entry.record));
+          if (seen.has(fingerprint)) break;
+          seen.add(fingerprint);
+          const next = findIssGridNavigationButton(doc, 'pageDown');
+          if (!next || !isIssControlReady(next) || !await trustedClick(next)) break;
+          const changed = await waitForCondition(() => getIssProtheusPageFingerprint(readIssProtheusGridPage(doc)) !== fingerprint, 3000, 80, signal);
+          if (!changed) break;
+        }
+        throw new Error('ISS Corretora: título indicado como SIM não localizado na grade; nenhuma baixa efetuada.');
+      },
+      open: async () => {
+        // O Protheus mantém componentes de janelas antigas no DOM. Um botão
+        // ainda visível dentro de wa-dialog[blocked] não pode receber CDP.
+        const findOther = () => unique(doc, 'wa-button', (node) => caption(node) === 'outras acoes', true);
+        const findManual = () => unique(doc, 'wa-menu-popup-item', (node) => caption(node) === 'baixa manual', true);
+        const findManualAny = () => unique(doc, 'wa-menu-popup-item', (node) => caption(node) === 'baixa manual', false);
+        const findAction = () => unique(doc, 'wa-menu-popup-item', (node) =>
+          caption(node) === 'baixar' && node.parentElement === findManual(), true);
+        return openIssSettlementMenu({
+          findOther, findManual, findManualAny, findAction, dialog, trustedClick, trustedHover,
+          signal, onLog: opts.onLog, onStatus: opts.onStatus,
+          wait: (predicate, timeoutMs) => waitForCondition(predicate, timeoutMs, 80, signal)
+        });
+      },
+      configure: async () => {
+        const initial = readForm();
+        const differences = getIssSettlementIdentityDifferences(record, initial);
+        if (differences.length)
+          throw new Error('ISS Corretora: dados da janela divergentes (' + differences.join(', ') + '); Salvar bloqueado.');
+        const reason = field('cMotBx');
+        if (!reason || !setIssFilterComboboxByText(reason, 'DEBITO CC')) throw new Error('ISS Corretora: motivo DÉBITO CC não confirmado.');
+        const bank = field('cBanco');
+        if (!await confirmIssSettlementBank(bank, {
+          signal, onTrustedClick: trustedClick, onTrustedText: trustedText, onTrustedKey: trustedKey,
+          resolveControl: () => field('cBanco')
+        })) throw new Error('ISS Corretora: banco 033 não confirmado.');
+        return readForm();
+      },
+      read: readForm,
+      approve: opts.onApprove,
+      cancel: async () => {
+        const panel = dialog();
+        const button = panel && unique(panel, 'wa-button', (node) => caption(node) === 'cancelar', true);
+        return !!button && !!(await trustedClick(button)) && !!(await waitForCondition(() => !dialog(), 4000, 80, signal));
+      },
+      save: async () => {
+        const button = dialog() && unique(dialog(), 'wa-button', (node) => caption(node) === 'salvar', true);
+        if (!button || !isIssControlReady(button)) return false;
+        const guard = armIssClickValidation(button, () => assertIssSettlementForm(record, readForm()));
+        try { return !!(await trustedClick(button)) && !guard.error(); }
+        finally { guard.release(); }
+      },
+      verify: async (_wanted, form) => {
+        // A janela pode ficar no DOM marcada como blocked logo após Salvar.
+        // Só leia a grade quando a janela realmente deixar de cobri-la.
+        const ready = await waitForStableCondition(() => isIssSettlementGridReady(doc), 12000, 100, 250, signal);
+        if (!ready) return false;
+        const localConfirmed = await waitForCondition(() => {
+          try { return isIssSettlementConfirmed(record, readIssProtheusGridPage(doc), form.paymentDate); }
+          catch (_) { return false; }
+        }, 4000, 100, signal);
+        if (localConfirmed) return true;
+        // A grade pode saltar de página após Salvar: nesse caso percorra tudo
+        // e exija encontrar exatamente o título baixado com a data esperada.
+        const all = await collectIssProtheusGridRecords(doc, { signal, onTrustedClick: trustedClick });
+        return isIssSettlementConfirmed(record, all, form.paymentDate);
+      }
+    };
+    return runIssSingleSettlement(record, adapter, opts);
+  }
+
+  function findIssProtheusGrid(doc) {
+    const required = ['prefixo', 'no. titulo', 'natureza', 'vencto real', 'vlr.titulo'];
+    const grids = listIssActiveNodes(doc || document, (node) => String(node.tagName || '').toUpperCase() === 'WA-TGRID');
+    const matches = grids.filter((grid) => {
+      let root = null;
+      try { root = grid.shadowRoot; } catch (_) {}
+      if (!root) return false;
+      let labels = [];
+      try { labels = Array.from(root.querySelectorAll('thead th')).map((th) => normalizeText(th.innerText || th.textContent || '')); } catch (_) {}
+      return required.every((label) => labels.includes(label));
+    });
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  function readIssProtheusGridPage(doc) {
+    const grid = findIssProtheusGrid(doc || document);
+    if (!grid) throw new Error('ISS Corretora: a grade filtrada do Contas a Pagar não foi localizada de forma única.');
+    let root = null;
+    try { root = grid.shadowRoot; } catch (_) {}
+    if (!root) throw new Error('ISS Corretora: a grade filtrada não disponibilizou seu conteúdo para leitura.');
+    const text = (node) => {
+      try { return String(node && (node.innerText || node.textContent) || '').trim(); } catch (_) { return ''; }
+    };
+    let headers = [];
+    let rows = [];
+    try {
+      headers = Array.from(root.querySelectorAll('thead th')).map(text);
+      rows = Array.from(root.querySelectorAll('tbody tr')).map((row) => Array.from(row.querySelectorAll('td')).map(text));
+    } catch (_) {}
+    if (!rows.length) throw new Error('ISS Corretora: o filtro foi aplicado, mas a grade não apresentou registros para conferência.');
+    return parseIssProtheusGridMatrix(headers, rows);
+  }
+
+  function findIssGridNavigationButton(doc, action) {
+    const fileByAction = {
+      top: 'fwskin_scroll_top.png',
+      bottom: 'fwskin_scroll_btm.png',
+      pageDown: 'fwskin_scroll_pgdown.png'
+    };
+    const expected = fileByAction[action];
+    if (!expected) return null;
+    const source = doc || document;
+    const grid = findIssProtheusGrid(source);
+    let scope = grid;
+    for (let depth = 0; scope && depth < 60 && String(scope.tagName || '').toUpperCase() !== 'WA-DIALOG'; depth++) {
+      scope = scope.parentElement || (scope.getRootNode && scope.getRootNode().host);
+    }
+    const roots = collectRoots(scope || source);
+    const matches = [];
+    const seen = new Set();
+    for (const root of roots) {
+      let buttons = [];
+      try { buttons = Array.from(root.querySelectorAll('wa-button')); } catch (_) {}
+      for (const button of buttons) {
+        if (!button || seen.has(button)) continue;
+        seen.add(button);
+        let source = '';
+        try { source += String(button.getAttribute('style') || ''); } catch (_) {}
+        try { source += ' ' + String(button.shadowRoot && button.shadowRoot.innerHTML || ''); } catch (_) {}
+        if (source.toLowerCase().includes(expected)) matches.push(button);
+      }
+    }
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  function assertIssGridUnblocked(doc) {
+    const openSettlement = listIssActiveNodes(doc || document, (node) =>
+      String(node.tagName || '').toUpperCase() === 'WA-DIALOG' &&
+      String(node.getAttribute && node.getAttribute('title') || '') === 'Baixas a Pagar'
+    ).some(isElementStateActive);
+    if (openSettlement) {
+      throw new Error('ISS Corretora: feche a janela Baixas a Pagar com Cancelar antes de ler a grade; se Salvar já foi acionado, confira a baixa antes de prosseguir.');
+    }
+    return true;
+  }
+
+  async function collectIssProtheusGridRecords(doc, options) {
+    const source = doc || (typeof document !== 'undefined' ? document : null);
+    const opts = options || {};
+    const signal = opts.signal;
+    const onTrustedClick = typeof opts.onTrustedClick === 'function' ? opts.onTrustedClick : null;
+    const readPage = typeof opts.readPage === 'function' ? opts.readPage : () => readIssProtheusGridPage(source);
+    const clickNavigation = async (action, expectedFingerprint) => {
+      if (source) assertIssGridUnblocked(source);
+      let target = null;
+      const ready = await waitForStableCondition(() => {
+        target = findIssGridNavigationButton(source, action);
+        return !!target && isIssControlReady(target);
+      }, 5000, 80, 180, signal);
+      if (!ready && target && isControlLocked(target)) return action === 'top';
+      if (!ready) throw new Error('ISS Corretora: a navegação "' + action + '" da grade não ficou pronta; o diálogo permaneceu bloqueado ou em transição.');
+      if (!target) throw new Error('ISS Corretora: o botão de navegação "' + action + '" da grade não foi localizado de forma única.');
+      if (expectedFingerprint && getIssProtheusPageFingerprint(readPage()) !== expectedFingerprint) return 'page-changed';
+      if (!onTrustedClick) throw new Error('ISS Corretora: interação confiável não foi disponibilizada para percorrer a grade.');
+      const pageGuard = expectedFingerprint ? armIssGridPageClickValidation(target, readPage, expectedFingerprint) : null;
+      try {
+        const clicked = !!(await Promise.resolve(onTrustedClick(target)));
+        if (pageGuard && pageGuard.pageChanged()) return 'page-changed';
+        if (!clicked) {
+          if (source) assertIssGridUnblocked(source);
+          throw new Error('ISS Corretora: o Protheus recusou o clique de navegação "' + action + '" da grade; verifique se há uma janela aberta sobre o filtro.');
+        }
+        return true;
+      } finally {
+        if (pageGuard) pageGuard.release();
+      }
+    };
+    const advancePage = typeof opts.advancePage === 'function' ? opts.advancePage : () => clickNavigation('pageDown');
+    const retryAdvancePage = typeof opts.retryAdvancePage === 'function'
+      ? opts.retryAdvancePage
+      : (fingerprint) => clickNavigation('pageDown', fingerprint);
+    const restoreTop = typeof opts.restoreTop === 'function' ? opts.restoreTop : () => clickNavigation('top');
+    const waitForPageChange = typeof opts.waitForPageChange === 'function'
+      ? opts.waitForPageChange
+      : (fingerprint) => waitForCondition(() => getIssProtheusPageFingerprint(readPage()) !== fingerprint, 3000, 80, signal);
+    const confirmEnd = typeof opts.confirmEnd === 'function'
+      ? opts.confirmEnd
+      : (typeof opts.advancePage === 'function'
+        ? async () => true
+        : async (fingerprint) => {
+            let bottomClicked = await clickNavigation('bottom');
+            if (!bottomClicked) {
+              await abortableSleep(400, signal);
+              if (getIssProtheusPageFingerprint(readPage()) !== fingerprint) return false;
+              bottomClicked = await clickNavigation('bottom');
+              if (!bottomClicked) {
+                throw new Error('ISS Corretora: os controles inferiores da grade permaneceram bloqueados; não foi possível confirmar o fim dos registros.');
+              }
+            }
+            return !(await Promise.resolve(waitForPageChange(fingerprint)));
+          });
+    const maxPages = Math.max(1, Number(opts.maxPages) || 500);
+    const recordsByIdentity = new Map();
+    let topFingerprint = '';
+
+    const waitForNavigationReady = typeof opts.waitForNavigationReady === 'function'
+      ? opts.waitForNavigationReady
+      : (source
+        ? () => waitForStableCondition(() => {
+            const top = findIssGridNavigationButton(source, 'top');
+            return !!top && isIssControlReady(top);
+          }, 8000, 80, 250, signal)
+        : async () => true);
+    if (source) assertIssGridUnblocked(source);
+    const navigationReady = await Promise.resolve(waitForNavigationReady());
+    if (!navigationReady) {
+      throw new Error('ISS Corretora: a navegação da grade não ficou pronta porque o diálogo do Protheus permaneceu bloqueado.');
+    }
+
+    const restoredInitially = await Promise.resolve(restoreTop());
+    if (!restoredInitially) throw new Error('ISS Corretora: não foi possível restaurar o início da grade antes da conferência.');
+    if (typeof opts.restoreTop !== 'function') {
+      await abortableSleep(350, signal);
+      const candidateFingerprint = getIssProtheusPageFingerprint(readPage());
+      const restoredAgain = await Promise.resolve(restoreTop());
+      if (!restoredAgain) throw new Error('ISS Corretora: não foi possível confirmar o início da grade antes da conferência.');
+      const movedToTop = await Promise.resolve(waitForPageChange(candidateFingerprint));
+      if (movedToTop) await abortableSleep(350, signal);
+    }
+
+    try {
+      for (let page = 0; page < maxPages; page++) {
+        throwIfAborted(signal);
+        const records = readPage();
+        if (page === 0) topFingerprint = getIssProtheusPageFingerprint(records);
+        records.forEach((record) => { if (!recordsByIdentity.has(record.identity)) recordsByIdentity.set(record.identity, record); });
+        const fingerprint = getIssProtheusPageFingerprint(records);
+        const advanced = await Promise.resolve(advancePage());
+        if (!advanced) {
+          const reachedEnd = await Promise.resolve(confirmEnd(fingerprint));
+          if (!reachedEnd) {
+            throw new Error('ISS Corretora: a grade ainda possuía registros abaixo, mas a paginação não avançou com segurança.');
+          }
+          break;
+        }
+        let changed = await Promise.resolve(waitForPageChange(fingerprint));
+        if (!changed && (typeof opts.advancePage !== 'function' || typeof opts.retryAdvancePage === 'function')) {
+          const retryResult = await Promise.resolve(retryAdvancePage(fingerprint));
+          if (retryResult === 'page-changed') changed = true;
+          else if (retryResult) changed = await Promise.resolve(waitForPageChange(fingerprint));
+        }
+        if (!changed) {
+          const reachedEnd = await Promise.resolve(confirmEnd(fingerprint));
+          if (!reachedEnd) {
+            throw new Error('ISS Corretora: a grade ainda possuía registros abaixo, mas a paginação não avançou com segurança.');
+          }
+          break;
+        }
+        if (page === maxPages - 1) throw new Error('ISS Corretora: a leitura da grade excedeu o limite seguro de páginas.');
+      }
+    } finally {
+      const restored = await Promise.resolve(restoreTop());
+      if (!restored) throw new Error('ISS Corretora: não foi possível restaurar o início da grade após a conferência.');
+      const verifyTopRestored = typeof opts.verifyTopRestored === 'function'
+        ? opts.verifyTopRestored
+        : () => getIssProtheusPageFingerprint(readPage()) === topFingerprint;
+      const topRestored = topFingerprint && await waitForCondition(verifyTopRestored, 5000, 80, signal);
+      if (!topRestored) throw new Error('ISS Corretora: o comando de retorno foi enviado, mas a grade não confirmou a restauração ao início.');
+    }
+
+    const records = Array.from(recordsByIdentity.values());
+    if (!records.length) throw new Error('ISS Corretora: nenhum registro foi coletado da grade filtrada.');
+    return records;
+  }
+
   function isIssGridFilteredByNatureza(doc, expectedValue) {
     const values = getIssGridColumnValues(doc || document, 'Natureza');
     const wanted = normalizeText(expectedValue);
@@ -1895,6 +3005,7 @@
     const onTrustedClick = typeof opts.onTrustedClick === 'function' ? opts.onTrustedClick : null;
     const onTrustedText = typeof opts.onTrustedText === 'function' ? opts.onTrustedText : null;
     const onTrustedKey = typeof opts.onTrustedKey === 'function' ? opts.onTrustedKey : null;
+    const onManualDatePause = typeof opts.onManualDatePause === 'function' ? opts.onManualDatePause : null;
     const rules = Array.isArray(opts.rules) ? opts.rules : [];
     if (!rules.length) throw new Error('ISS Corretora: ao menos uma regra é necessária para criação dinâmica do filtro.');
     if (!onTrustedClick || !onTrustedText || (rules.some((rule) => String(rule && rule.valueType || '').toLowerCase() === 'date') && !onTrustedKey)) throw new Error('ISS Corretora: interação confiável não foi disponibilizada para criar o filtro.');
@@ -1904,7 +3015,19 @@
     const filterName = String(opts.filterName || ('POS AUTO ISS ' + Date.now())).trim();
     if (!filterName) throw new Error('ISS Corretora: nome automático do filtro inválido.');
 
-    const trustedClick = async (target) => !!(await Promise.resolve(onTrustedClick(target)));
+    const trustedClick = async (target, validate) => {
+      const ready = await waitForStableCondition(() => isIssControlReady(target), 5000, 60, 180, signal);
+      if (!ready) return false;
+      if (typeof validate === 'function') validate();
+      const guard = typeof validate === 'function' ? armIssClickValidation(target, validate) : null;
+      try {
+        const sent = !!(await Promise.resolve(onTrustedClick(target)));
+        if (guard && guard.error()) throw guard.error();
+        return sent;
+      } finally {
+        if (guard) guard.release();
+      }
+    };
 
     onStatus('ISS CORRETORA — aguardando Contas a Pagar carregar...');
     const accountsPayableReady = await waitForIssCorretoraAccountsPayableReady(source, {
@@ -2007,7 +3130,7 @@
     const nameReady = await performVerifiedAction(source, {
       label: 'ISS Corretora — Preencher nome do filtro',
       findTarget: findIssFilterNameControl,
-      execute: (control) => dispatchIssFilterTextControl(control, filterName, { signal, onTrustedClick, onTrustedText, onLog }),
+      execute: (control) => dispatchIssFilterTextControl(control, filterName, { signal, onTrustedClick, onTrustedText, onLog, resolveControl: () => findIssFilterNameControl(source) }),
       isSuccess: (currentDoc) => readIssFilterTextControl(findIssFilterNameControl(currentDoc)) === filterName,
       inspectRetryState: (currentDoc) => {
         const control = findIssFilterNameControl(currentDoc);
@@ -2030,7 +3153,7 @@
 
     for (let ruleIndex = 0; ruleIndex < rules.length; ruleIndex += 1) {
       const rule = rules[ruleIndex];
-      const conditionCaption = conditionCaptions[ruleIndex];
+      let conditionCaption = conditionCaptions[ruleIndex];
 
       if (ruleIndex > 0) {
         const connectorCountBefore = countIssFilterButtonsByCaption(source, 'e');
@@ -2107,14 +3230,75 @@
       });
       if (!operatorReady) throw new Error('ISS Corretora: operador do filtro não pôde ser selecionado semanticamente: ' + String(rule.operator || ''));
 
-      const expectedExpression = String(rule.value == null ? '' : rule.value);
+      let expectedExpression = String(rule.value == null ? '' : rule.value);
       const isDateRule = String(rule.valueType || '').toLowerCase() === 'date';
+
+      if (isDateRule && onManualDatePause) {
+        const manualControl = await waitForIssInputReady(findIssFilterExpressionControl(source), {
+          signal,
+          resolveControl: () => findIssFilterExpressionControl(source)
+        }, 'mask');
+        if (!manualControl) throw new Error('ISS Corretora: o campo de data não ficou disponível para a pausa manual.');
+
+        // A pausa manual não pode falhar só porque o Protheus recusou/moveu o foco.
+        // Tentamos posicionar o cursor localmente apenas como conveniência; se não der,
+        // o usuário ainda pode clicar no campo normalmente e informar a data.
+        const focused = focusIssFilterTextControl(manualControl, { selectAll: true });
+        if (!focused) {
+          emitDiagnostic(onLog, 'ISS_CORRETORA_DATE_MANUAL_FOCUS_OPTIONAL', 'Campo Vencto Real ficou disponível, mas o foco automático não foi confirmado; a pausa seguirá para permitir clique manual.', {
+            ruleIndex,
+            field: String(rule.field || ''),
+            target: describeActionTarget(manualControl)
+          });
+        }
+
+        onStatus('ISS CORRETORA — PAUSADO: ajuste manualmente o Vencto Real e clique em Continuar.');
+        emitDiagnostic(onLog, 'ISS_CORRETORA_DATE_MANUAL_PAUSE', 'Rotina pausada antes de preencher Vencto Real; aguardando ajuste manual do usuário.', {
+          ruleIndex,
+          field: String(rule.field || ''),
+          suggestedValue: expectedExpression
+        });
+        await Promise.resolve(onManualDatePause({
+          field: String(rule.field || ''),
+          suggestedValue: expectedExpression,
+          ruleIndex
+        }));
+        throwIfAborted(signal);
+        await abortableSleep(250, signal);
+
+        const currentControl = findIssFilterExpressionControl(source);
+        const manualValue = readIssFilterTextControl(currentControl).trim();
+        const dateMatch = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(manualValue);
+        let validManualDate = false;
+        if (dateMatch) {
+          const day = Number(dateMatch[1]);
+          const month = Number(dateMatch[2]);
+          const year = Number(dateMatch[3]);
+          const parsed = new Date(year, month - 1, day);
+          validManualDate = parsed.getFullYear() === year && parsed.getMonth() === month - 1 && parsed.getDate() === day;
+        }
+        if (!validManualDate) {
+          throw new Error('ISS Corretora: informe manualmente uma data válida no Vencto Real no formato DD/MM/AAAA antes de clicar em Continuar.');
+        }
+
+        rule.value = manualValue;
+        expectedExpression = manualValue;
+        conditionCaption = formatIssFilterConditionCaption(rule);
+        conditionCaptions[ruleIndex] = conditionCaption;
+        emitDiagnostic(onLog, 'ISS_CORRETORA_DATE_MANUAL_RESUME', 'Pausa manual concluída; Vencto Real informado pelo usuário será usado no restante do filtro.', {
+          ruleIndex,
+          field: String(rule.field || ''),
+          value: manualValue,
+          conditionCaption
+        });
+      }
+
       const expressionReady = await performVerifiedAction(source, {
         label: 'ISS Corretora — Preencher expressão do filtro',
         findTarget: findIssFilterExpressionControl,
         execute: (control) => isDateRule
-          ? dispatchIssFilterDateControl(control, expectedExpression, { signal, onTrustedClick, onTrustedKey, onLog })
-          : dispatchIssFilterTextControl(control, expectedExpression, { signal, onTrustedClick, onTrustedText, onLog }),
+          ? dispatchIssFilterDateControl(control, expectedExpression, { signal, onTrustedClick, onTrustedKey, onLog, resolveControl: () => findIssFilterExpressionControl(source) })
+          : dispatchIssFilterTextControl(control, expectedExpression, { signal, onTrustedClick, onTrustedText, onLog, resolveControl: () => findIssFilterExpressionControl(source) }),
         isSuccess: (currentDoc) => readIssFilterTextControl(findIssFilterExpressionControl(currentDoc)) === expectedExpression,
         inspectRetryState: (currentDoc) => {
           const control = findIssFilterExpressionControl(currentDoc);
@@ -2140,7 +3324,14 @@
       const conditionReady = await performVerifiedAction(source, {
         label: 'ISS Corretora — Adicionar condição',
         findTarget: findIssFilterAddButton,
-        execute: trustedClick,
+        execute: (target) => trustedClick(target, () => {
+          if (readIssFilterTextControl(findIssFilterNameControl(source)) !== filterName ||
+              readIssFilterTextControl(findIssFilterExpressionControl(source)) !== expectedExpression ||
+              normalizeText(readIssFilterComboboxText(findIssFilterFieldControl(source))) !== normalizeText(rule.field) ||
+              normalizeText(readIssFilterComboboxText(findIssFilterOperatorControl(source))) !== normalizeText(rule.operator)) {
+            throw new Error('ISS Corretora: nome, campo, operador ou expressão mudou antes de Adicionar. Nenhuma condição foi adicionada.');
+          }
+        }),
         isSuccess: (currentDoc) => !!findIssFilterConditionButton(currentDoc, conditionCaption),
         inspectRetryState: (currentDoc) => {
           if (findIssFilterConditionButton(currentDoc, conditionCaption)) return { state: 'success', reason: 'chip da condição criado' };
@@ -2166,7 +3357,14 @@
     const savedReady = await performVerifiedAction(source, {
       label: 'ISS Corretora — Salvar filtro',
       findTarget: findIssFilterSaveButton,
-      execute: trustedClick,
+      execute: (target) => trustedClick(target, () => {
+        const actualName = readIssFilterTextControl(findIssFilterNameControl(source));
+        const complete = isIssFilterExpressionComplete(source, conditionCaptions);
+        if (actualName !== filterName || !complete) {
+          emitDiagnostic(onLog, 'ISS_FILTER_INTEGRITY_BLOCKED', 'Salvar bloqueado: nome ou condições do filtro divergiram.', { expectedName: filterName, actualName, complete });
+          throw new Error('ISS Corretora: filtro alterado durante a criação. Salvar bloqueado para evitar gravar nome/condições incorretos.');
+        }
+      }),
       isSuccess: (currentDoc) => !findIssFilterCreateDialog(currentDoc) && !!findIssFilterManagerMarker(currentDoc) && !!findIssSavedFilterCheckbox(currentDoc, filterName),
       inspectRetryState: (currentDoc) => {
         if (!findIssFilterCreateDialog(currentDoc) && findIssFilterManagerMarker(currentDoc) && findIssSavedFilterCheckbox(currentDoc, filterName)) {
@@ -2191,10 +3389,10 @@
     const selectionReady = await performVerifiedAction(source, {
       label: 'ISS Corretora — Selecionar filtro salvo',
       findTarget: (currentDoc) => findIssSavedFilterCheckbox(currentDoc, filterName),
-      execute: async (target, context) => {
+      execute: async (target) => {
         const before = isIssCheckboxChecked(target);
-        const strategy = context && context.attempt > 1 ? 'trusted' : 'native';
-        const executed = await activateIssSavedFilterCheckbox(target, { strategy, onTrustedClick, onLog });
+        const strategy = 'trusted-indicator';
+        const executed = await activateIssSavedFilterCheckbox(target, { onTrustedClick: trustedClick, onLog });
         const after = isIssCheckboxChecked(target);
         if (after) filterSelectionObserved = true;
         emitDiagnostic(onLog, 'ISS_CORRETORA_FILTER_SELECTION_STATE', 'Tentativa de seleção enviada; Aplicar só será liberado depois que o checkbox estiver realmente marcado.', {
@@ -2218,13 +3416,13 @@
         const saved = findIssSavedFilterCheckbox(currentDoc, filterName);
         if (saved && isIssCheckboxChecked(saved)) return { state: 'success', reason: 'checkbox do filtro confirmado como marcado' };
         if (findIssFilterManagerMarker(currentDoc) && findIssFilterApplyButton(currentDoc) && saved) {
-          return { state: 'previous', reason: 'checkbox do filtro continua desmarcado; é seguro tentar outra estratégia sem risco de desmarcar' };
+          return { state: 'processing', reason: 'checkbox ainda desmarcado; aguardando confirmação sem repetir um clique já enviado' };
         }
         return { state: 'processing', reason: 'gerenciador está atualizando a seleção do filtro' };
       },
-      retryPolicy: VERIFIED_ACTION_RETRY_POLICIES.VERIFY_BEFORE_RETRY,
+      retryPolicy: VERIFIED_ACTION_RETRY_POLICIES.NEVER_BLIND_RETRY,
       maxAttempts: 2,
-      effectTimeoutMs: 900,
+      effectTimeoutMs: 1500,
       processingTimeoutMs: 1200,
       effectPollMs: 40,
       retryDelayMs: 120,
@@ -5164,7 +6362,7 @@
     // Itens de menu e textos clicáveis do Protheus recebem a interação no
     // elemento interno do Shadow DOM. Disparar mouse/pointer apenas no host
     // pode não acionar o handler ADVPL, mesmo que o elemento seja encontrado.
-    if (tag === 'WA-MENU-ITEM') {
+    if (tag === 'WA-MENU-ITEM' || tag === 'WA-MENU-POPUP-ITEM') {
       try {
         if (el.shadowRoot) {
           const inner = el.shadowRoot.querySelector('span.caption,[class~="caption"],span[tabindex]');
@@ -5185,6 +6383,8 @@
     if (tag === 'WA-CHECKBOX') {
       try {
         if (el.shadowRoot) {
+          const label = el.shadowRoot.querySelector('label');
+          if (label) return label;
           const inner = el.shadowRoot.querySelector('input[type="checkbox"]:not([disabled])');
           if (inner) return inner;
         }
@@ -6149,13 +7349,13 @@
       }
     }
 
+    // Mantem o campo focado aqui. O Protheus consolida alguns campos de data
+    // apenas quando recebe Enter; o blur acontece somente depois desse commit.
     dispatchSyntheticEvent(inner, 'change');
-    try { if (typeof inner.blur === 'function') inner.blur(); } catch (_) {}
-
     return readCommissionDateControlValue(control, parts) === text;
   }
 
-  async function fillCommissionDateReliably(doc, expectedName, parts, signal) {
+  async function fillCommissionDateReliably(doc, expectedName, parts, signal, onTrustedKey, onLog) {
     const source = doc || document;
     await abortableSleep(350, signal);
 
@@ -6163,11 +7363,39 @@
       throwIfAborted(signal);
       const control = findCommissionDateControl(source, expectedName);
       if (control && setCommissionDateControlValue(control, expectedName, parts)) {
-        await abortableSleep(300, signal);
-        const verifiedControl = findCommissionDateControl(source, expectedName);
-        const inner = getInnerEditable(verifiedControl);
-        if (verifiedControl && inner && readCommissionDateControlValue(verifiedControl, parts) === expectedDateInputValue(inner, parts)) {
-          return true;
+        await abortableSleep(180, signal);
+        let verifiedControl = findCommissionDateControl(source, expectedName);
+        let inner = getInnerEditable(verifiedControl);
+        const expected = inner ? expectedDateInputValue(inner, parts) : '';
+        if (verifiedControl && inner && readCommissionDateControlValue(verifiedControl, parts) === expected) {
+          // O valor visivel sozinho nao garante que o AdvPL registrou a data.
+          // Confirma com Enter real quando disponivel, igual ao fluxo manual.
+          try { if (typeof inner.focus === 'function') inner.focus(); } catch (_) {}
+          await abortableSleep(80, signal);
+
+          let enterCommitted = false;
+          if (typeof onTrustedKey === 'function') {
+            try { enterCommitted = !!(await Promise.resolve(onTrustedKey('Enter', verifiedControl))); } catch (_) {}
+          }
+          if (!enterCommitted) {
+            dispatchSyntheticEvent(inner, 'keydown', { key: 'Enter', code: 'Enter' });
+            dispatchSyntheticEvent(inner, 'keyup', { key: 'Enter', code: 'Enter' });
+          }
+          dispatchSyntheticEvent(inner, 'change');
+          try { if (typeof inner.blur === 'function') inner.blur(); } catch (_) {}
+
+          await abortableSleep(220, signal);
+          verifiedControl = findCommissionDateControl(source, expectedName);
+          inner = getInnerEditable(verifiedControl);
+          if (verifiedControl && inner && readCommissionDateControlValue(verifiedControl, parts) === expectedDateInputValue(inner, parts)) {
+            emitDiagnostic(onLog, 'DATE_FIELD_COMMIT', 'Data confirmada no Protheus com Enter antes de continuar.', {
+              name: expectedName,
+              value: formatDateBR(parts),
+              attempt,
+              trustedEnter: enterCommitted
+            });
+            return true;
+          }
         }
       }
 
@@ -6191,6 +7419,7 @@
     const onStatus = context.onStatus;
     const onLog = context.onLog;
     const signal = context.signal;
+    const onTrustedKey = context.onTrustedKey;
 
     onStatus('Grupo ' + groupValue + ': abrindo Lote Manual...');
     if (!await performConfirmedClick(source, {
@@ -6217,19 +7446,19 @@
 
     onStatus('Grupo ' + groupValue + ': preenchendo Dt Baixa De...');
     await waitForElement(source, (currentDoc) => findCommissionDateControl(currentDoc, COMMISSION_DATE_FIELDS.baixaDe), POLL_INTERVAL_MS, signal);
-    if (!await fillCommissionDateReliably(source, COMMISSION_DATE_FIELDS.baixaDe, dates.baixaDe, signal)) {
+    if (!await fillCommissionDateReliably(source, COMMISSION_DATE_FIELDS.baixaDe, dates.baixaDe, signal, onTrustedKey, onLog)) {
       throw new Error('Grupo ' + groupValue + ': Dt Baixa De não manteve a data ' + formatDateBR(dates.baixaDe) + '.');
     }
 
     onStatus('Grupo ' + groupValue + ': preenchendo Dt Baixa Ate...');
     await waitForElement(source, (currentDoc) => findCommissionDateControl(currentDoc, COMMISSION_DATE_FIELDS.baixaAte), POLL_INTERVAL_MS, signal);
-    if (!await fillCommissionDateReliably(source, COMMISSION_DATE_FIELDS.baixaAte, dates.baixaAte, signal)) {
+    if (!await fillCommissionDateReliably(source, COMMISSION_DATE_FIELDS.baixaAte, dates.baixaAte, signal, onTrustedKey, onLog)) {
       throw new Error('Grupo ' + groupValue + ': Dt Baixa Ate não manteve a data ' + formatDateBR(dates.baixaAte) + '.');
     }
 
     onStatus('Grupo ' + groupValue + ': preenchendo Data Pagto...');
     await waitForElement(source, (currentDoc) => findCommissionDateControl(currentDoc, COMMISSION_DATE_FIELDS.dataPagto), POLL_INTERVAL_MS, signal);
-    if (!await fillCommissionDateReliably(source, COMMISSION_DATE_FIELDS.dataPagto, dates.dataPagto, signal)) {
+    if (!await fillCommissionDateReliably(source, COMMISSION_DATE_FIELDS.dataPagto, dates.dataPagto, signal, onTrustedKey, onLog)) {
       throw new Error('Grupo ' + groupValue + ': Data Pagto não manteve a data ' + formatDateBR(dates.dataPagto) + '.');
     }
 
@@ -7742,7 +8971,7 @@
         generateGroup: async (groupValue, index, total) => {
           onStatus('Grupo ' + groupValue + ' (' + (index + 1) + '/' + total + '): sem lote. Iniciando geração...');
           emitDiagnostic(onLog, 'GROUP_GENERATE', 'Grupo sem lote. Iniciando geração.', { group: groupValue, index: index + 1, total });
-          const result = await generateCommissionGroup(source, groupValue, dates, { onStatus, onLog, signal });
+          const result = await generateCommissionGroup(source, groupValue, dates, { onStatus, onLog, signal, onTrustedKey: options.onTrustedKey });
           const verifiedLot = await waitForGeneratedCommissionLot(source, groupValue, { onStatus, onLog, signal });
           if (verifiedLot) {
             emitDiagnostic(onLog, 'GROUP_COMPLETE', 'Geração do grupo concluída e confirmada na tabela.', {
@@ -7894,10 +9123,13 @@
     extractIssGuideNumberFromText,
     getIssCorretoraCompetenceFromFileName,
     getIssCorretoraConferenceFields,
+    getIssCorretoraCsvFilePeriod,
     getIssCorretoraCsvFileNames,
     parseIssCorretoraCsvRecords,
     analyzeIssCorretoraCsvSources,
     extractIssGuideNumberFromDamspBarcode,
+    extractIssGuideTotalCentsFromDamspBarcode,
+    extractIssGuideTotalCentsFromText,
     extractIssGuideFromPdfBase64,
     findSoomarExpenseMapping,
     buildSoomarExpensePreview,
@@ -7921,7 +9153,11 @@
     findIssCorretoraRemoveAppliedFiltersButton,
     findIssFilterNameControl,
     normalizeIssFilterTextValue,
+    isIssFilterTokenSequenceValid,
+    armIssClickValidation,
+    armIssInputEventGuard,
     dispatchIssFilterTextControl,
+    confirmIssSettlementBank,
     dispatchIssFilterDateControl,
     findIssFilterFieldControl,
     findIssFilterOperatorControl,
@@ -7933,8 +9169,39 @@
     activateIssFilterManagerCreateButton,
     shouldProceedAfterIssFilterSelectionClick,
     activateIssSavedFilterCheckbox,
+    getIssTrustedClickAnchor,
     findIssFilterLogicalConnectorButton,
     countIssFilterButtonsByCaption,
+    parseIssProtheusCurrencyCents,
+    parseIssProtheusGridMatrix,
+    getIssProtheusPageFingerprint,
+    armIssGridPageClickValidation,
+    buildIssProtheusRecordsSummary,
+    buildIssProtheusSummarySections,
+    findBestIssSubset,
+    reconcileIssMunicipalWithProtheus,
+    applyIssSubsetSelection,
+    getIssRunDisplayOptions,
+    chooseIssReadyControl,
+    isIssSettlementMenuItemSelected,
+    openIssSettlementMenu,
+    assertIssPreappliedFilter,
+    chooseFirstIssSettlementRecord,
+    planIssSettlementBatch,
+    runIssSettlementBatch,
+    isIssSettlementConfirmed,
+    isIssSettlementGridReady,
+    readIssSettlementFieldValue,
+    getIssSettlementIdentityDifferences,
+    runIssSingleSettlement,
+    settleFirstIssRecordInProtheus: settleIssRecordInProtheus,
+    settleIssRecordInProtheus,
+    findIssProtheusGrid,
+    readIssProtheusGridPage,
+    findIssGridNavigationButton,
+    assertIssGridUnblocked,
+    collectIssProtheusGridRecords,
+    findIssFilterBanner,
     isIssGridFilteredByRules,
     runIssCorretoraDynamicFilter,
     findSoomarUpdatesButton,
